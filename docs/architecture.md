@@ -1,7 +1,7 @@
 # Architecture
 
-Prompt 1 builds on the operational foundation with Goose migrations and the
-public product listing for published reels.
+Prompt 2 builds on the operational foundation and public reel product listing
+with persisted interactions, shares, and watch sessions.
 
 ## Directory map
 
@@ -10,10 +10,10 @@ public product listing for published reels.
 | `cmd/migrate/` | Goose migration and status commands with PostgreSQL session locking | Implemented |
 | `cmd/api/` | Executable composition, logging, signals, HTTP lifecycle | Implemented |
 | `internal/config/` | Environment defaults and validation | Implemented |
-| `internal/transport/httpapi/` | Gin router, health and product responses, request/panic logging | Implemented |
-| `internal/adapter/postgres/` | pgxpool lifecycle and published reel product query | Implemented |
-| `internal/domain/` | Product model, standard Go only | Implemented |
-| `internal/usecase/` | Product listing and its reader interface | Implemented |
+| `internal/transport/httpapi/` | Gin router, health, product, and interaction responses, request/panic logging | Implemented |
+| `internal/adapter/postgres/` | pgxpool lifecycle, catalog reads, and reel write transactions | Implemented |
+| `internal/domain/` | Product, interaction kind, and persisted share | Implemented |
+| `internal/usecase/` | Product listing, interactions, shares, watch sessions, and consumer interfaces | Implemented |
 | `internal/adapter/redis/` | Redis infrastructure if a feature justifies it | Future; create with code |
 | `migrations/` | Versioned Goose SQL and embedded migration files | Implemented |
 | `cmd/seed/` | Reproducible assessment seed entry point | Future; decide implementation later |
@@ -79,6 +79,35 @@ one reel's associations in the requested order, including position ties.
 The query keeps explicit ordering regardless of PostgreSQL's plan.
 Prices are integer USD cents, and category slugs contain lowercase ASCII letters
 or digits separated by single hyphens.
+
+## Reel mutations
+
+The transport parses `X-User-ID` and checks the caller through its identity
+reader before dispatching to the relevant use case. Mock identity applies
+only to the authenticated write routes. The three write use cases own
+operation semantics, including the UTC view date, self-share validation,
+and percentage calculation from stored watch time.
+
+- Likes, saves, and views take a PostgreSQL row lock on the published reel
+  before changing interaction rows. Partial unique indexes enforce active
+  like/save uniqueness and one view per UTC date. Affected row counts drive
+  atomic counter increments or decrements in the same transaction. A counter
+  failure rolls back the interaction change.
+- Shares use a unique sender/key constraint and `INSERT ... ON CONFLICT DO
+  NOTHING`. A retry reads the winning row in a new statement at Read Committed
+  isolation, then compares the stored reel and recipient before replaying it.
+- Watch sessions use the user/playback key. A conditional upsert keeps the
+  stored reel binding and uses `GREATEST` to retain cumulative progress.
+  Shares and watch reports use a shared reel lock to keep publication state
+  and duration stable during their transactions.
+- Identity lookups and write transactions have a three-second deadline
+  bounded by the request context. PostgreSQL errors stay in the adapter's
+  returned error chain. HTTP returns generic failures for unexpected errors.
+
+Migration 00002 adds required reel duration without a backfill. Apply it
+first to an empty reel catalog or prepare a separate backfill for existing
+data. Username and email uniqueness are based on `lower()` in the database
+collation.
 
 ## References
 

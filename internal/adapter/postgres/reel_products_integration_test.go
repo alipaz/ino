@@ -29,11 +29,11 @@ func TestListReelProductsPostgres(t *testing.T) {
 
 	const fixtures = `
 		INSERT INTO creators (id, display_name) VALUES (1, 'Creator');
-		INSERT INTO reels (id, creator_id, caption, video_url, thumbnail_url, status) VALUES
-			(1, 1, 'With products', 'video', 'thumbnail', 'published'),
-			(2, 1, 'Empty', 'video', 'thumbnail', 'published'),
-			(3, 1, 'Draft', 'video', 'thumbnail', 'draft'),
-			(4, 1, 'Archived', 'video', 'thumbnail', 'archived');
+		INSERT INTO reels (id, creator_id, caption, video_url, thumbnail_url, status, duration_ms) VALUES
+			(1, 1, 'With products', 'video', 'thumbnail', 'published', 30000),
+			(2, 1, 'Empty', 'video', 'thumbnail', 'published', 30000),
+			(3, 1, 'Draft', 'video', 'thumbnail', 'draft', 30000),
+			(4, 1, 'Archived', 'video', 'thumbnail', 'archived', 30000);
 		INSERT INTO products (id, title, brand, image_url, price, category) VALUES
 			(11, 'Tie first', 'INO', 'first.png', 725, 'home-goods'),
 			(12, 'Tie second', 'INO', 'second.png', 0, 'home-goods'),

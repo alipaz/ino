@@ -59,6 +59,12 @@ func run(ctx context.Context, cfg config.Config, logger *slog.Logger) error {
 	router := httpapi.NewRouter(logger, pool.Ping)
 	reelProducts := usecase.NewReelProducts(postgres.NewReelProductReader(pool))
 	httpapi.RegisterReelProductRoutes(router, logger, reelProducts)
+
+	reelWriter := postgres.NewReelWriter(pool)
+	reelWrites := httpapi.NewReelWriteRoutes(router, logger, reelWriter)
+	httpapi.RegisterReelInteractionRoutes(reelWrites, logger, usecase.NewReelInteractions(reelWriter))
+	httpapi.RegisterReelShareRoutes(reelWrites, logger, usecase.NewReelShares(reelWriter))
+	httpapi.RegisterReelWatchSessionRoutes(reelWrites, logger, usecase.NewReelWatchSessions(reelWriter))
 	server := &http.Server{
 		Addr:              cfg.HTTPAddr,
 		Handler:           router,

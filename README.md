@@ -1,7 +1,8 @@
 # INO Explore
 
-A Go backend with Gin, PostgreSQL, Redis and Docker Compose. Prompt 1 adds
-versioned migrations and the public product listing for published reels.
+A Go backend with Gin, PostgreSQL, Redis and Docker Compose. Prompt 2 adds
+reel interactions, internal shares, and watch progress alongside the public
+product listing.
 
 Read [the project contract](docs/project-contract.md),
 [architecture](docs/architecture.md) and [agent instructions](AGENTS.md) before
@@ -63,6 +64,13 @@ same `DATABASE_URL`. Goose records applied versions in `goose_db_version`.
 A normal `docker compose down` followed by `docker compose up` reuses the
 named PostgreSQL volume and preserves existing rows.
 
+Migration `00002_create_reel_interactions.sql` assumes an empty pre-launch
+reel catalog on first application. Every reel must have a positive
+`duration_ms`, and the migration supplies no default duration for older
+rows. If your volume already contains reels, preserve it and plan a duration
+backfill before applying migration 00002 there. Use a disposable database
+for the examples and tests below.
+
 ```sh
 docker compose logs migrate
 docker compose run --rm migrate status
@@ -90,6 +98,52 @@ request returns 404 until reel 1 is inserted and published.
 | 500 | Unexpected server failure |
 
 Errors use `{"error":"..."}`. This endpoint is public and ignores `X-User-ID`.
+
+## Reel interactions, shares, and watch progress
+
+All routes in this table are under `/api/v1/reels/{id}`. Use one
+`X-User-ID` header with the positive decimal ID of an existing user. The
+header is mock identity. The product listing remains public.
+
+| Method and path | Success | Retry behavior |
+| --- | --- | --- |
+| `POST /like`, `POST /save` | 204 | Sets one active like or save per user and reel. |
+| `DELETE /like`, `DELETE /save` | 204 | Clears that active row, including when already absent. |
+| `POST /view` | 204 | Counts once per user and reel per server UTC calendar date. |
+| `POST /share` | 201 | Same sender, key, reel, and recipient replay the original receipt even after archival. A different valid payload for that sender and key returns 409. |
+| `PUT /watch-sessions/{playback_id}` | 200 | Keeps the highest cumulative active watch time. Reusing the playback ID for another reel under the same user returns 409. |
+
+Keys and playback IDs are case-sensitive and accept 1–128 ASCII characters
+from `A–Z`, `a–z`, `0–9`, and `._~-`. JSON requests are limited to 2 KiB.
+Invalid IDs, keys, and JSON return 400. Missing, malformed, or unknown caller
+identity returns 401. A missing or non-published reel returns 404 unless the
+request replays an existing share. An unknown recipient for a new share
+returns 404. Self-sharing returns 400. Error responses use `{"error":"..."}`.
+Username and email uniqueness use PostgreSQL `lower()` with the database
+collation. Stored values retain case and cannot be blank or surrounded by
+spaces.
+
+With users 1 and 2 and a published reel 1 of duration 30,000 ms in a test database:
+
+```sh
+base=http://127.0.0.1:8080/api/v1/reels/1
+curl -i -X POST "$base/like" -H 'X-User-ID: 1'
+curl -i -X DELETE "$base/like" -H 'X-User-ID: 1'
+curl -i -X POST "$base/view" -H 'X-User-ID: 1'
+curl -i -X POST "$base/share" -H 'X-User-ID: 1' \
+  -H 'Idempotency-Key: share-001' -H 'Content-Type: application/json' \
+  -d '{"recipient_user_id":2}'
+curl -i -X PUT "$base/watch-sessions/playback-001" -H 'X-User-ID: 1' \
+  -H 'Content-Type: application/json' -d '{"watched_ms":21000}'
+```
+
+A share returns `id`, `sender_id`, `recipient_id`, `reel_id`,
+`idempotency_key`, and the UTC `created_at` of the stored record. Use a new
+key to intentionally resend while the reel is published. Replaying an existing
+receipt preserves its ID, timestamp, and every response field. Watch progress
+returns `{"watched_ms":21000,"watch_percentage":70}` for the example above. It
+measures cumulative active playback in milliseconds. The percentage uses
+the stored time and caps at 100. Watch reports do not count as views.
 
 ## Smoke checks
 
@@ -121,7 +175,7 @@ existing containers and named volumes are unaffected (choose a unique name
 for each run):
 
 ```sh
-export COMPOSE_PROJECT_NAME=ino-prompt1-smoke-unique
+export COMPOSE_PROJECT_NAME=ino-prompt2-smoke-unique
 export API_PORT=18080
 docker compose up --build -d --wait --wait-timeout 120
 curl --fail http://127.0.0.1:18080/livez
@@ -151,7 +205,7 @@ docker run --rm -d --name ino-postgres-test \
 # Wait for this command to report "accepting connections".
 docker exec ino-postgres-test pg_isready -h 127.0.0.1 -U postgres
 INO_TEST_DATABASE_URL='postgres://postgres:ino_test@127.0.0.1:15432/postgres?sslmode=disable' \
-  go test -count=1 -v ./internal/adapter/postgres -run TestListReelProductsPostgres
+  go test -count=1 -v ./internal/adapter/postgres -run 'Postgres$'
 docker stop ino-postgres-test
 ```
 
