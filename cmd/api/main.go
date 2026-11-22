@@ -17,6 +17,7 @@ import (
 	"ino/internal/adapter/postgres"
 	"ino/internal/config"
 	"ino/internal/transport/httpapi"
+	"ino/internal/usecase"
 )
 
 func main() {
@@ -55,9 +56,12 @@ func run(ctx context.Context, cfg config.Config, logger *slog.Logger) error {
 	defer pool.Close()
 
 	gin.SetMode(gin.ReleaseMode)
+	router := httpapi.NewRouter(logger, pool.Ping)
+	reelProducts := usecase.NewReelProducts(postgres.NewReelProductReader(pool))
+	httpapi.RegisterReelProductRoutes(router, logger, reelProducts)
 	server := &http.Server{
 		Addr:              cfg.HTTPAddr,
-		Handler:           httpapi.NewRouter(logger, pool.Ping),
+		Handler:           router,
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       10 * time.Second,
 		WriteTimeout:      10 * time.Second,

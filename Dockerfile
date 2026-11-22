@@ -4,11 +4,19 @@ COPY go.mod go.sum ./
 RUN go mod download
 COPY cmd ./cmd
 COPY internal ./internal
-RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/api ./cmd/api
+COPY migrations ./migrations
+RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/ ./cmd/api ./cmd/migrate
 
-FROM alpine:3.22.2
+FROM alpine:3.22.2 AS runtime
 RUN addgroup -S -g 10001 ino && adduser -S -D -H -u 10001 -G ino ino
-COPY --from=build /out/api /usr/local/bin/api
 USER ino
+
+FROM runtime AS migrate
+COPY --from=build /out/migrate /usr/local/bin/migrate
+ENTRYPOINT ["/usr/local/bin/migrate"]
+CMD ["up"]
+
+FROM runtime AS api
+COPY --from=build /out/api /usr/local/bin/api
 EXPOSE 8080
 ENTRYPOINT ["/usr/local/bin/api"]

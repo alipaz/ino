@@ -1,4 +1,4 @@
-// Package httpapi adapts operational endpoints to Gin.
+// Package httpapi adapts HTTP endpoints to Gin.
 package httpapi
 
 import (

@@ -1,4 +1,4 @@
-// Package postgres owns PostgreSQL connection setup. No domain schema exists yet.
+// Package postgres owns PostgreSQL connection setup and data access.
 package postgres
 
 import (

@@ -1,7 +1,7 @@
 # INO Explore
 
-Prompt 0: a Go operational foundation with Gin, PostgreSQL, Redis and Docker
-Compose. Only `GET /livez` and `GET /readyz` are implemented.
+A Go backend with Gin, PostgreSQL, Redis and Docker Compose. Prompt 1 adds
+versioned migrations and the public product listing for published reels.
 
 Read [the project contract](docs/project-contract.md),
 [architecture](docs/architecture.md) and [agent instructions](AGENTS.md) before
@@ -12,14 +12,15 @@ starting another phase.
 Install Docker with Compose v2. No host Go installation or `.env` is needed:
 
 ```sh
-docker compose up --build
+docker compose up
 ```
 
-For subsequent starts, `docker compose up` also works from a clean checkout.
+Use `docker compose up --build` after changing Go code or SQL migrations.
 The API listens at `http://127.0.0.1:8080`. PostgreSQL and Redis are reachable
 as `postgres:5432` and `redis:6379` inside the Compose network; neither publishes
-a host port. Compose waits for dependency health checks, and the API also waits
-for a successful PostgreSQL ping before opening its listener.
+a host port. Once PostgreSQL is healthy, the one-shot `migrate` service applies
+pending Goose migrations. The API starts after migration success and Redis
+health, then checks its own PostgreSQL connection before listening.
 
 ## Configuration
 
@@ -48,12 +49,47 @@ new data volume; existing roles/passwords must be changed in PostgreSQL itself.
 excluded from the Docker build context. Commit only example credentials.
 
 For a host Go run (Go 1.25+), supply `DATABASE_URL` for a PostgreSQL instance
-reachable from the host, then run `go run ./cmd/api`. The application requires
+reachable from the host, run `go run ./cmd/migrate up`, then run `go run ./cmd/api`. The application requires
 that variable and defaults `HTTP_ADDR` to `:8080`; Compose fixes the internal
 address at `:8080`. `.env` is read by Compose, not by the Go binary.
 
 The build pins Go 1.25.4 and Alpine 3.22.2; Compose pins PostgreSQL 18.6 and
 Redis 8.10.2. Redis persists via AOF but is not accessed by Go in this phase.
+
+## Migrations
+
+Goose runs the embedded SQL files in `migrations/`. API and migrator use the
+same `DATABASE_URL`. Goose records applied versions in `goose_db_version`.
+A normal `docker compose down` followed by `docker compose up` reuses the
+named PostgreSQL volume and preserves existing rows.
+
+```sh
+docker compose logs migrate
+docker compose run --rm migrate status
+docker compose run --rm --build migrate up
+```
+
+## List products for a published reel
+
+```sh
+curl -i http://127.0.0.1:8080/api/v1/reels/1/products
+```
+
+The endpoint accepts a decimal reel ID from 1 through 9223372036854775807.
+A published reel returns HTTP 200 and `{"products":[...]}`. Each product has
+`id`, `title`, `brand`, `image_url`, `price` (USD cents), and `category`
+(a lowercase slug). Results are ordered by display position, then by product
+ID, both ascending. A published reel with no products returns
+`{"products":[]}`. A fresh database has no fixture rows, so the example
+request returns 404 until reel 1 is inserted and published.
+
+| Status | Meaning |
+| --- | --- |
+| 400 | Invalid reel ID |
+| 404 | Missing, draft, or archived reel |
+| 500 | Unexpected server failure |
+
+Errors use `{"error":"..."}`. This endpoint is public and ignores `X-User-ID`.
 
 ## Smoke checks
 
@@ -85,7 +121,7 @@ existing containers and named volumes are unaffected (choose a unique name
 for each run):
 
 ```sh
-export COMPOSE_PROJECT_NAME=ino-prompt0-smoke-unique
+export COMPOSE_PROJECT_NAME=ino-prompt1-smoke-unique
 export API_PORT=18080
 docker compose up --build -d --wait --wait-timeout 120
 curl --fail http://127.0.0.1:18080/livez
@@ -99,6 +135,24 @@ docker compose start postgres
 curl --retry 10 --retry-all-errors --retry-delay 1 --fail http://127.0.0.1:18080/readyz
 docker compose down --volumes # Deletes this disposable project's data only
 unset COMPOSE_PROJECT_NAME API_PORT
+```
+
+## PostgreSQL integration tests
+
+The tests apply the same migrations to a temporary schema in a PostgreSQL
+database and remove that schema afterward. The test role needs permission to
+create schemas. Without `INO_TEST_DATABASE_URL`, `go test ./...` skips these
+cases. To run them against a disposable instance, choose a free local port
+and unused container name:
+
+```sh
+docker run --rm -d --name ino-postgres-test \
+  -e POSTGRES_PASSWORD=ino_test -p 127.0.0.1:15432:5432 postgres:18.6-alpine
+# Wait for this command to report "accepting connections".
+docker exec ino-postgres-test pg_isready -h 127.0.0.1 -U postgres
+INO_TEST_DATABASE_URL='postgres://postgres:ino_test@127.0.0.1:15432/postgres?sslmode=disable' \
+  go test -count=1 -v ./internal/adapter/postgres -run TestListReelProductsPostgres
+docker stop ino-postgres-test
 ```
 
 ## Shutdown

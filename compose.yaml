@@ -1,19 +1,33 @@
+x-database-url: &database-url "${DATABASE_URL:-postgres://ino:ino_local@postgres:5432/ino?sslmode=disable}"
+
 services:
   api:
     build: .
     environment:
       HTTP_ADDR: ":8080"
-      DATABASE_URL: "${DATABASE_URL:-postgres://ino:ino_local@postgres:5432/ino?sslmode=disable}"
+      DATABASE_URL: *database-url
       DB_STARTUP_TIMEOUT: "${DB_STARTUP_TIMEOUT:-30s}"
       LOG_LEVEL: "${LOG_LEVEL:-info}"
     ports:
       - "127.0.0.1:${API_PORT:-8080}:8080"
     depends_on:
+      migrate:
+        condition: service_completed_successfully
       postgres:
         condition: service_healthy
       redis:
         condition: service_healthy
     stop_grace_period: 15s
+
+  migrate:
+    build:
+      context: .
+      target: migrate
+    environment:
+      DATABASE_URL: *database-url
+    depends_on:
+      postgres:
+        condition: service_healthy
 
   postgres:
     image: postgres:18.6-alpine
@@ -24,7 +38,7 @@ services:
     volumes:
       - postgres_data:/var/lib/postgresql
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U \"$$POSTGRES_USER\" -d \"$$POSTGRES_DB\""]
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U \"$$POSTGRES_USER\" -d \"$$POSTGRES_DB\""]
       interval: 5s
       timeout: 3s
       retries: 10

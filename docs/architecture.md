@@ -1,43 +1,46 @@
 # Architecture
 
-Prompt 0 is an operational foundation. There are no feature models, domain
-tables, use cases, migrations, seeds or cache clients yet.
+Prompt 1 builds on the operational foundation with Goose migrations and the
+public product listing for published reels.
 
 ## Directory map
 
 | Location | Responsibility | Status |
 | --- | --- | --- |
+| `cmd/migrate/` | Goose migration and status commands with PostgreSQL session locking | Implemented |
 | `cmd/api/` | Executable composition, logging, signals, HTTP lifecycle | Implemented |
 | `internal/config/` | Environment defaults and validation | Implemented |
-| `internal/transport/httpapi/` | Gin router, operational HTTP responses, request/panic logging | Implemented |
-| `internal/adapter/postgres/` | pgxpool creation, bounded startup readiness | Implemented |
-| `internal/domain/` | Entities and domain invariants, standard Go only | Future; create with code |
-| `internal/usecase/` | Business rules and application operations; consumer-owned ports | Future; create with code |
+| `internal/transport/httpapi/` | Gin router, health and product responses, request/panic logging | Implemented |
+| `internal/adapter/postgres/` | pgxpool lifecycle and published reel product query | Implemented |
+| `internal/domain/` | Product model, standard Go only | Implemented |
+| `internal/usecase/` | Product listing and its reader interface | Implemented |
 | `internal/adapter/redis/` | Redis infrastructure if a feature justifies it | Future; create with code |
-| `migrations/` | Versioned PostgreSQL schema changes | Future; choose tooling later |
+| `migrations/` | Versioned Goose SQL and embedded migration files | Implemented |
 | `cmd/seed/` | Reproducible assessment seed entry point | Future; decide implementation later |
 | `docs/` | Architecture, assessment contract and phase history | Implemented |
 
 ## Dependency direction
 
-Future transport adapters call use cases; use cases depend on domain code.
+Transport adapters call use cases, and use cases depend on domain code.
 Concrete persistence adapters implement interfaces defined near their use-case
 consumers. `cmd/api` connects them. Domain and use cases must remain independent
 of Gin, pgx, Redis, HTTP routing and infrastructure configuration. Handlers
 translate HTTP; they do not own business rules. Adapters own infrastructure
-details. Do not create generic repositories or interfaces before a consumer
-requires them.
+details. Define interfaces when a consumer needs them.
 
 Currently `cmd/api` imports configuration, PostgreSQL and HTTP adapters. The
 HTTP adapter receives a `func(context.Context) error` for operational readiness
-and does not import pgx. This callback is not a business use-case abstraction.
+and does not import pgx. The product handler receives the `ReelProducts` use
+case, which consumes its own `ReelProductReader` interface.
 
 ## Startup and shutdown
 
 1. Compose starts PostgreSQL and Redis, each with its own container health
    check and named data volume. Only the API publishes a host port.
-2. Compose waits for both dependencies to be healthy before starting `api`.
-   Redis health is verified by Compose; the application does not connect to it.
+2. After PostgreSQL becomes healthy over TCP, Compose runs `migrate` with the
+   same database URL as `api`. Goose applies pending SQL migrations and tracks
+   versions. Compose waits for migration success and healthy PostgreSQL and
+   Redis before starting the API. Redis health is verified by Compose.
 3. The executable validates environment configuration and initializes JSON
    `slog` logging. It installs SIGINT/SIGTERM cancellation before database startup.
 4. The PostgreSQL adapter parses `DATABASE_URL`, creates a pool capped at ten
@@ -60,6 +63,22 @@ Request, startup, shutdown, panic and server error logs use JSON. Request logs
 omit headers and query strings; panic values and raw PostgreSQL errors are not
 logged to avoid exposing credentials. Redis is not part of Go readiness until
 a later feature establishes a runtime dependency.
+
+## Product listing query and indexes
+
+The adapter uses one parameterized query filtered by reel ID and published
+status. The left joins retain a published reel with zero products as one
+row with a null product ID. Zero rows means no published reel matched.
+The use case converts that absence to a not-found error, and the handler
+maps it to HTTP 404. The handler forwards the request context through to pgx.
+
+The `reels` and `products` primary-key indexes support ID lookup. The
+`reel_products` primary key enforces one association per reel and product.
+The separate `(reel_id, display_position, product_id)` index supports scanning
+one reel's associations in the requested order, including position ties.
+The query keeps explicit ordering regardless of PostgreSQL's plan.
+Prices are integer USD cents, and category slugs contain lowercase ASCII letters
+or digits separated by single hyphens.
 
 ## References
 
