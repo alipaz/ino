@@ -1,20 +1,21 @@
 # Architecture
 
-Prompt 2 builds on the operational foundation and public reel product listing
-with persisted interactions, shares, and watch sessions.
+The cache phase adds Redis-backed reads and share receipts to the existing
+PostgreSQL catalog and write paths.
 
 ## Directory map
 
 | Location | Responsibility | Status |
 | --- | --- | --- |
 | `cmd/migrate/` | Goose migration and status commands with PostgreSQL session locking | Implemented |
+| `cmd/read-projector/` | Runs the outbox projector with process-local PostgreSQL and Redis connections | Implemented |
 | `cmd/api/` | Executable composition, logging, signals, HTTP lifecycle | Implemented |
 | `internal/config/` | Environment defaults and validation | Implemented |
-| `internal/transport/httpapi/` | Gin router, health, product, and interaction responses, request/panic logging | Implemented |
-| `internal/adapter/postgres/` | pgxpool lifecycle, catalog reads, and reel write transactions | Implemented |
-| `internal/domain/` | Product, interaction kind, and persisted share | Implemented |
-| `internal/usecase/` | Product listing, interactions, shares, watch sessions, and consumer interfaces | Implemented |
-| `internal/adapter/redis/` | Redis infrastructure if a feature justifies it | Future; create with code |
+| `internal/transport/httpapi/` | Gin router, health and reel responses, activity reads, request/panic logging | Implemented |
+| `internal/adapter/postgres/` | pgxpool lifecycle, catalog and activity reads, writes, and outbox claiming | Implemented |
+| `internal/domain/` | Products, interactions, shares, and activity events | Implemented |
+| `internal/usecase/` | Catalog and interaction reads, writes, and consumer interfaces | Implemented |
+| `internal/adapter/redis/` | Redis read decorators, share receipts, and the activity projector | Implemented |
 | `migrations/` | Versioned Goose SQL and embedded migration files | Implemented |
 | `cmd/seed/` | Reproducible assessment seed entry point | Future; decide implementation later |
 | `docs/` | Architecture, assessment contract and phase history | Implemented |
@@ -28,10 +29,11 @@ of Gin, pgx, Redis, HTTP routing and infrastructure configuration. Handlers
 translate HTTP; they do not own business rules. Adapters own infrastructure
 details. Define interfaces when a consumer needs them.
 
-Currently `cmd/api` imports configuration, PostgreSQL and HTTP adapters. The
-HTTP adapter receives a `func(context.Context) error` for operational readiness
-and does not import pgx. The product handler receives the `ReelProducts` use
-case, which consumes its own `ReelProductReader` interface.
+`cmd/api` wires PostgreSQL-backed readers through Redis decorators and injects
+them into the existing product use case and the new interaction-read use case.
+The HTTP adapter receives a PostgreSQL ping function for operational readiness.
+The Redis adapter owns the client, scripts, fallbacks, and projector. The
+use-case interfaces expose domain results without referring to Redis or pgx.
 
 ## Startup and shutdown
 
@@ -39,8 +41,9 @@ case, which consumes its own `ReelProductReader` interface.
    check and named data volume. Only the API publishes a host port.
 2. After PostgreSQL becomes healthy over TCP, Compose runs `migrate` with the
    same database URL as `api`. Goose applies pending SQL migrations and tracks
-   versions. Compose waits for migration success and healthy PostgreSQL and
-   Redis before starting the API. Redis health is verified by Compose.
+   versions. Both `api` and `read-projector` wait for migration success and healthy
+   PostgreSQL. They start independently. Redis has its own health check
+   and is optional for API startup.
 3. The executable validates environment configuration and initializes JSON
    `slog` logging. It installs SIGINT/SIGTERM cancellation before database startup.
 4. The PostgreSQL adapter parses `DATABASE_URL`, creates a pool capped at ten
@@ -61,8 +64,7 @@ case, which consumes its own `ReelProductReader` interface.
 
 Request, startup, shutdown, panic and server error logs use JSON. Request logs
 omit headers and query strings; panic values and raw PostgreSQL errors are not
-logged to avoid exposing credentials. Redis is not part of Go readiness until
-a later feature establishes a runtime dependency.
+logged to avoid exposing credentials. Redis is outside operational readiness.
 
 ## Product listing query and indexes
 
@@ -83,8 +85,8 @@ or digits separated by single hyphens.
 ## Reel mutations
 
 The transport parses `X-User-ID` and checks the caller through its identity
-reader before dispatching to the relevant use case. Mock identity applies
-only to the authenticated write routes. The three write use cases own
+reader before dispatching to the relevant use case. Private GETs cache the
+existence check, and writes use PostgreSQL identity checks. The three write use cases own
 operation semantics, including the UTC view date, self-share validation,
 and percentage calculation from stored watch time.
 
@@ -108,6 +110,57 @@ Migration 00002 adds required reel duration without a backfill. Apply it
 first to an empty reel catalog or prepare a separate backfill for existing
 data. Username and email uniqueness are based on `lower()` in the database
 collation.
+
+## Cache fills and recent activity projection
+
+Redis holds TTL-limited snapshots of products, interaction state, recent
+activity, and the outcome of user existence checks. Product and interaction
+snapshots include reel visibility. Both also use a shared catalog epoch, so
+a catalog or publication change invalidates visibility together with product
+contents. State invalidations apply to the affected user and reel. Identity
+entries hold only an existence flag. A cold load claims a random generation
+before querying PostgreSQL. The guarded Redis fill succeeds only if the
+generation, current value, and applicable catalog epoch still match. An
+invalidation, an eviction, or a competing fill can invalidate the claim.
+This guards against an older database read repopulating an invalidated entry.
+
+A single API process coalesces fallback work per key. It admits up to four
+concurrent PostgreSQL reads with a deadline of 750 ms each, and rejects excess
+fallback work with 503. An individual waiting request can cancel independently
+of the shared load. Redis calls use a separate configurable deadline.
+Successful reads and writes tolerate Redis connection and fill failures.
+
+Migration 00003 uses PostgreSQL hooks to append activity and enqueue cache
+work in the originating transaction. The watch threshold latch records the
+first 70% crossing without changing the watch reporting path. Sessions already
+at or above the threshold are marked without backfilling events. Catalog and
+identity changes enqueue their own invalidations. Event IDs and event times
+remain durable in PostgreSQL independently of cache delivery.
+
+The separate `read-projector` process polls every 250 ms when idle. Its pool
+has two PostgreSQL connections, one for the outbox transaction and one for a
+snapshot read. Its Redis client is capped at two connections. The API has
+its own PostgreSQL pool capped at ten connections, a Redis cap of twelve
+connections, and a separate four-slot fallback limiter. Signals cancel the
+projector's active batch before closing its clients. A batch claims at most 16
+outbox rows with `FOR UPDATE SKIP LOCKED` inside a five-second transaction.
+Redis success allows acknowledgement by deleting the processed outbox rows.
+Failures roll back the acknowledgement and retry after one second. Delayed
+and repeated jobs invalidate state rather than applying an old field value.
+For recent activity they load the latest 100 durable rows ordered by event time
+and ID descending. A compare-and-set writes the whole complete Redis snapshot
+and applies the TTL atomically. If another request already installed exactly
+the same complete snapshot in the same generation, the projector acknowledges
+the batch without rewriting the value or extending the TTL. A changed
+generation or a competing fill with a different value still triggers a retry.
+Activity committed during a rebuild has its own outbox notification. Eviction
+or data loss also permits an on-demand rebuild. Durable history is retained when outbox rows are acknowledged.
+
+The share decorator caches immutable receipts after the writer commits, keyed
+by sender and idempotency key. After request validation, a hit compares reel
+and recipient before replaying the receipt. On a miss PostgreSQL keeps the
+existing authoritative uniqueness and conflict handling. See the
+[README](../README.md#redis-behavior-and-freshness) for TTLs and failure behavior.
 
 ## References
 

@@ -15,7 +15,8 @@ complete feature API specification. Read it alongside [architecture.md](architec
 - Automated migrations and seed execution in the final deliverable.
 - Seed minima: **20 creators, 200 reels, 100 products and 1,000 interactions**.
 - Unit tests and tests against real PostgreSQL for persistence and concurrency
-  behavior. Prompts 1 and 2 cover the product listing and interactions with HTTP and PostgreSQL tests.
+  behavior. Prompts 1 and 2 cover product listing and interactions. The caching phase adds
+  integration coverage with Redis and PostgreSQL.
 - Small Clean Architecture boundaries; domain and use cases independent of
   Gin, pgx and Redis.
 
@@ -31,7 +32,7 @@ later prompt before implementation:
 | Cursor stability | Encoding, ordering, snapshot/change semantics and duplicates/omissions between pages |
 | Endpoint behavior | Feed routes, payloads, validation, filtering, pagination bounds and identity |
 | Concurrency | Feed consistency and future feature transaction boundaries |
-| Redis usage | Which feature needs it, data ownership, consistency, invalidation and failure behavior; defer the Go client until then |
+| Redis usage | Caching and invalidation policy for future features |
 | Final automation | Seed command, startup ordering for seed data and reproducibility |
 
 Each prompt settles only the part of this contract it authorizes. Retain prior
@@ -107,3 +108,37 @@ requires a positive duration for every new reel. It adds users, interactions,
 shares, watch sessions, and reel counters. Feed ranking, personalization,
 delivery or inbox features, full seed data, and Redis caching remain outside
 this phase.
+
+## Redis caching phase status
+
+**Complete (2026-11-22).** Go tests, vet, Compose config, and the explicit
+PostgreSQL and Redis integration suites passed. The isolated Compose smoke
+test applied migration 00003, restarted the API with Redis stopped, and
+verified fallback, durable writes, and projector recovery after Redis resumed.
+
+The public products response keeps the same shape and order.
+`GET /api/v1/reels/{id}/interaction-state` returns the caller's `liked` and
+`saved` flags for a published reel. `GET /api/v1/me/interactions/recent`
+returns up to 100 events in descending event-time and event-ID order. Both
+private GETs require an existing `X-User-ID`. A warm GET makes no PostgreSQL
+queries, including for identity and publication checks. A cold or unavailable
+cache reads PostgreSQL with a bounded fallback. Unavailable or overloaded
+fallback returns 503. See the [README](../README.md#redis-behavior-and-freshness)
+for TTLs, failure behavior, and verification commands.
+
+PostgreSQL owns writes and history. Migration 00003 captures effective
+like/save changes, counted views, new shares, and the first 70% watch
+threshold crossing in the same transactions. Earlier activity is outside
+this history. Sessions that already qualified at migration are latched
+without creating historical events. The watch reporting contract is unchanged.
+A transactional outbox delivers invalidations and complete recent-activity
+snapshots. Redis state can lag between commit and projection or expiry.
+
+The share cache is populated only after commit. The same sender, key, reel,
+and recipient replay the original 201 receipt even after archival. Reuse of
+a key with a different valid payload returns 409. A new share of an archived
+reel returns 404. PostgreSQL remains the authority for misses, concurrent
+writes, and Redis outages.
+
+Feed ranking, ordering, pagination, personalization, messaging, and
+notifications remain outside this phase.

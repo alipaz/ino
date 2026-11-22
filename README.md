@@ -1,8 +1,7 @@
 # INO Explore
 
-A Go backend with Gin, PostgreSQL, Redis and Docker Compose. Prompt 2 adds
-reel interactions, internal shares, and watch progress alongside the public
-product listing.
+A Go backend with Gin, PostgreSQL, Redis and Docker Compose. This phase adds
+Redis-backed reads and share receipt replay, plus durable recent activity.
 
 Read [the project contract](docs/project-contract.md),
 [architecture](docs/architecture.md) and [agent instructions](AGENTS.md) before
@@ -20,8 +19,9 @@ Use `docker compose up --build` after changing Go code or SQL migrations.
 The API listens at `http://127.0.0.1:8080`. PostgreSQL and Redis are reachable
 as `postgres:5432` and `redis:6379` inside the Compose network; neither publishes
 a host port. Once PostgreSQL is healthy, the one-shot `migrate` service applies
-pending Goose migrations. The API starts after migration success and Redis
-health, then checks its own PostgreSQL connection before listening.
+pending Goose migrations. The API starts after migration success and checks
+its PostgreSQL connection before listening. It can start and serve requests
+while Redis is unavailable.
 
 ## Configuration
 
@@ -41,7 +41,9 @@ docker compose up --build
 | `POSTGRES_DB` | `ino` | Development database |
 | `DATABASE_URL` | `postgres://ino:ino_local@postgres:5432/ino?sslmode=disable` | API connection string |
 | `DB_STARTUP_TIMEOUT` | `30s` | Maximum PostgreSQL startup wait |
-| `LOG_LEVEL` | `info` | `debug`, `info`, `warn`, `error` |
+| `REDIS_URL` | Compose `redis://redis:6379/0` | Redis endpoint. For a host run, leave it empty to use PostgreSQL only. |
+| `CACHE_REDIS_TIMEOUT` | `50ms` | Deadline per Redis operation |
+| `LOG_LEVEL` | `info` | `debug` includes cache hit, miss, fallback, and projector lag logs |
 
 When changing `POSTGRES_*`, update `DATABASE_URL` to match and URI-encode reserved
 characters in credentials. PostgreSQL initialization variables apply only to a
@@ -55,7 +57,7 @@ that variable and defaults `HTTP_ADDR` to `:8080`; Compose fixes the internal
 address at `:8080`. `.env` is read by Compose, not by the Go binary.
 
 The build pins Go 1.25.4 and Alpine 3.22.2; Compose pins PostgreSQL 18.6 and
-Redis 8.10.2. Redis persists via AOF but is not accessed by Go in this phase.
+Redis 8.10.2. The application uses go-redis v9, and Redis persists via AOF.
 
 ## Migrations
 
@@ -95,6 +97,7 @@ request returns 404 until reel 1 is inserted and published.
 | --- | --- |
 | 400 | Invalid reel ID |
 | 404 | Missing, draft, or archived reel |
+| 503 | PostgreSQL fallback unavailable or at capacity |
 | 500 | Unexpected server failure |
 
 Errors use `{"error":"..."}`. This endpoint is public and ignores `X-User-ID`.
@@ -145,6 +148,85 @@ returns `{"watched_ms":21000,"watch_percentage":70}` for the example above. It
 measures cumulative active playback in milliseconds. The percentage uses
 the stored time and caps at 100. Watch reports do not count as views.
 
+## Interaction state and recent activity
+
+Both reads require `X-User-ID` for an existing user. With the fixtures above:
+
+```sh
+curl -fsS -H 'X-User-ID: 1' http://127.0.0.1:8080/api/v1/reels/1/interaction-state
+curl -fsS -H 'X-User-ID: 1' http://127.0.0.1:8080/api/v1/me/interactions/recent
+```
+
+Interaction state returns `{"liked":false,"saved":false}` when both flags are
+unset and returns 404 for a missing, draft, or archived reel. Recent activity
+returns `{"events":[...]}`, or `{"events":[]}` for an empty history. Each event
+has `id`, `user_id`, `reel_id`, `type`, and UTC `event_time`. It returns up
+to 100 events ordered by event time descending, then event ID descending.
+Missing or invalid identity returns 401. An overloaded or unavailable
+PostgreSQL fallback returns `503 {"error":"read_unavailable"}`.
+
+History begins with migration 00003. Events include `like_added`,
+`like_removed`, `save_added`, `save_removed`, `view_counted`,
+`share_created`, and `watch_interest`. The watch event records only the
+first crossing of 70% in a playback session. A session that already reached
+70% before migration is treated as having crossed the threshold without
+creating a historical event. The watch API and duplicate-report behavior
+stay the same.
+
+## API and read projector
+
+`docker compose up --build` starts two independent processes after migration.
+Only `api` serves HTTP. Its PostgreSQL pool is capped at 10 connections, with
+up to four concurrent cache fallbacks, and its Redis client is capped at 12
+connections. The `read-projector` service uses its
+own PostgreSQL pool capped at two connections: one for the outbox transaction
+and one for a snapshot read. It also uses a separate Redis client capped at
+two connections. Outbox batches have a five-second deadline, and PostgreSQL
+snapshot reads have a 750 ms deadline. Both processes use
+`CACHE_REDIS_TIMEOUT` for Redis calls.
+
+With `DATABASE_URL` and `REDIS_URL` set, run the projector locally with
+`go run ./cmd/read-projector`. SIGINT or SIGTERM cancels polling and any active
+batch. Unacknowledged rows stay in PostgreSQL. Stop or start the Compose
+projector independently with `docker compose stop read-projector` and
+`docker compose start read-projector`. The API can keep serving and writing
+while the projector is stopped.
+
+## Redis behavior and freshness
+
+| Entry | TTL |
+| --- | ---: |
+| Public reel products and publication state | 15 seconds |
+| Interaction state and publication state | 10 seconds |
+| Recent activity snapshot | 15 seconds |
+| Mock identity existence | 15 seconds |
+| Immutable share receipt | 5 minutes |
+
+A warm GET reads Redis only, including its identity and reel visibility
+checks. Valid empty results and false flags are cache hits. Missing,
+incomplete, or unavailable entries fall back to PostgreSQL. Each API process
+coalesces simultaneous loads of the same key and admits up to four concurrent
+PostgreSQL fallbacks across keys. There is no waiting queue for those slots.
+The PostgreSQL read deadline is 750 ms. Cache population is best effort.
+
+PostgreSQL commits writes and activity together. Redis reads can lag while the
+projector delivers committed invalidations. For example, a previously cached
+published reel can briefly return its products after archival until the
+catalog invalidation reaches Redis or the entry expires. Expiration is
+measured from the fill and reads do not extend it. The projector polls every
+250 ms when idle and retries after one second if Redis fails or the guarded
+snapshot write cannot prove it is current. A complete, byte-identical
+foreground fill in the same generation is acknowledged without refreshing
+its TTL. Redis outages keep writes durable
+and leave undelivered outbox work in PostgreSQL. Activity snapshots rebuild
+from the ordered PostgreSQL history after Redis data loss.
+
+Share requests still validate identity with PostgreSQL. A cached receipt
+then bypasses the PostgreSQL share writer and returns the original response,
+including after archival. The receipt is cached only after PostgreSQL
+commits. An unavailable cache falls back to the existing transactional share
+path, including its payload check and database uniqueness constraint.
+
 ## Smoke checks
 
 In another terminal while the stack is running:
@@ -175,7 +257,8 @@ existing containers and named volumes are unaffected (choose a unique name
 for each run):
 
 ```sh
-export COMPOSE_PROJECT_NAME=ino-prompt2-smoke-unique
+export COMPOSE_PROJECT_NAME=ino-cache-smoke-unique
+export LOG_LEVEL=debug
 export API_PORT=18080
 docker compose up --build -d --wait --wait-timeout 120
 curl --fail http://127.0.0.1:18080/livez
@@ -188,25 +271,38 @@ docker compose start postgres
 # Allow PostgreSQL to finish starting; /readyz should return 200 again.
 curl --retry 10 --retry-all-errors --retry-delay 1 --fail http://127.0.0.1:18080/readyz
 docker compose down --volumes # Deletes this disposable project's data only
-unset COMPOSE_PROJECT_NAME API_PORT
+unset COMPOSE_PROJECT_NAME API_PORT LOG_LEVEL
 ```
+
+To check Redis fallback manually in that disposable stack, warm the three GETs
+above against the chosen API port after loading test fixtures. Repeat them
+and look for `cache read` logs with outcome `hit`. Run
+`docker compose stop redis`, repeat the same GETs, and check that the bodies
+match and the logs show `cache fallback`. Run `docker compose start redis` to
+allow cache fills and queued invalidations to resume. Perform this check
+before bringing the disposable stack down. The integration suite below
+counts pgx queries during cold and warm HTTP requests to verify the zero-query
+GET contract.
 
 ## PostgreSQL integration tests
 
 The tests apply the same migrations to a temporary schema in a PostgreSQL
 database and remove that schema afterward. The test role needs permission to
 create schemas. Without `INO_TEST_DATABASE_URL`, `go test ./...` skips these
-cases. To run them against a disposable instance, choose a free local port
-and unused container name:
+cases. The combined Redis tests also require `INO_TEST_REDIS_URL` pointing to
+an empty, disposable Redis database. The suite flushes that test database.
+Choose free local ports and unused container names:
 
 ```sh
 docker run --rm -d --name ino-postgres-test \
   -e POSTGRES_PASSWORD=ino_test -p 127.0.0.1:15432:5432 postgres:18.6-alpine
 # Wait for this command to report "accepting connections".
 docker exec ino-postgres-test pg_isready -h 127.0.0.1 -U postgres
+docker run --rm -d --name ino-redis-test -p 127.0.0.1:16379:6379 redis:8.10.2-alpine
 INO_TEST_DATABASE_URL='postgres://postgres:ino_test@127.0.0.1:15432/postgres?sslmode=disable' \
-  go test -count=1 -v ./internal/adapter/postgres -run 'Postgres$'
-docker stop ino-postgres-test
+INO_TEST_REDIS_URL='redis://127.0.0.1:16379/0' \
+  go test -count=1 -p 1 -v ./internal/adapter/postgres ./internal/adapter/redis -run 'Postgres(Redis)?$|Redis$'
+docker stop ino-postgres-test ino-redis-test
 ```
 
 ## Shutdown

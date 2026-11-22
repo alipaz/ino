@@ -11,13 +11,18 @@ import (
 )
 
 // Open waits for a successful query, bounded by the caller's startup context.
-// The caller owns the returned pool and must close it after HTTP shutdown.
+// The caller owns the returned pool and must close it after use.
 func Open(ctx context.Context, dsn string) (*pgxpool.Pool, error) {
+	return OpenWithMaxConns(ctx, dsn, 10)
+}
+
+// OpenWithMaxConns waits for PostgreSQL using a pool with an explicit connection budget.
+func OpenWithMaxConns(ctx context.Context, dsn string, maxConns int32) (*pgxpool.Pool, error) {
 	cfg, err := pgxpool.ParseConfig(dsn)
 	if err != nil {
 		return nil, errors.New("invalid DATABASE_URL")
 	}
-	cfg.MaxConns = 10
+	cfg.MaxConns = maxConns
 	cfg.ConnConfig.ConnectTimeout = 2 * time.Second
 	pool, err := pgxpool.NewWithConfig(ctx, cfg)
 	if err != nil {

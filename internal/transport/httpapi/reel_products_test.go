@@ -49,6 +49,7 @@ func TestListReelProductsMapsResponses(t *testing.T) {
 		},
 		{name: "published without products", found: true, status: 200, body: `{"products":[]}`},
 		{name: "no published reel", status: 404, body: `{"error":"reel_not_found"}`},
+		{name: "bounded fallback unavailable", err: usecase.ErrReadUnavailable, status: 503, body: `{"error":"read_unavailable"}`},
 		{name: "unexpected database failure", err: errors.New("postgres: sensitive internal details"), status: 500, body: `{"error":"internal_error"}`},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

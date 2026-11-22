@@ -33,6 +33,9 @@ func RegisterReelProductRoutes(router *gin.Engine, logger *slog.Logger, reelProd
 		case errors.Is(err, usecase.ErrReelNotFound):
 			c.JSON(http.StatusNotFound, gin.H{"error": "reel_not_found"})
 			return
+		case errors.Is(err, usecase.ErrReadUnavailable):
+			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "read_unavailable"})
+			return
 		case err != nil:
 			logger.Error("list reel products failed", "reel_id", id)
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "internal_error"})

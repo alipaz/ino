@@ -15,6 +15,7 @@ import (
 	"github.com/gin-gonic/gin"
 
 	"ino/internal/adapter/postgres"
+	cacheadapter "ino/internal/adapter/redis"
 	"ino/internal/config"
 	"ino/internal/transport/httpapi"
 	"ino/internal/usecase"
@@ -57,14 +58,29 @@ func run(ctx context.Context, cfg config.Config, logger *slog.Logger) error {
 
 	gin.SetMode(gin.ReleaseMode)
 	router := httpapi.NewRouter(logger, pool.Ping)
-	reelProducts := usecase.NewReelProducts(postgres.NewReelProductReader(pool))
+	redisClient, err := cacheadapter.NewClient(cfg.RedisURL, cfg.CacheRedisTimeout, 12)
+	if err != nil {
+		return err
+	}
+	if redisClient != nil {
+		defer redisClient.Close()
+	}
+	readCache := cacheadapter.NewReadCache(redisClient, cfg.CacheRedisTimeout, 4, logger)
+	productReader := cacheadapter.NewCachedReelProductReader(readCache, postgres.NewReelProductReader(pool))
+	reelProducts := usecase.NewReelProducts(productReader)
 	httpapi.RegisterReelProductRoutes(router, logger, reelProducts)
 
 	reelWriter := postgres.NewReelWriter(pool)
 	reelWrites := httpapi.NewReelWriteRoutes(router, logger, reelWriter)
 	httpapi.RegisterReelInteractionRoutes(reelWrites, logger, usecase.NewReelInteractions(reelWriter))
-	httpapi.RegisterReelShareRoutes(reelWrites, logger, usecase.NewReelShares(reelWriter))
+	shareWriter := cacheadapter.NewCachedShareWriter(readCache, reelWriter)
+	httpapi.RegisterReelShareRoutes(reelWrites, logger, usecase.NewReelShares(shareWriter))
 	httpapi.RegisterReelWatchSessionRoutes(reelWrites, logger, usecase.NewReelWatchSessions(reelWriter))
+	interactionReader := postgres.NewInteractionReader(pool)
+	cachedInteractions := cacheadapter.NewCachedInteractionReader(readCache, interactionReader, interactionReader)
+	cachedUsers := cacheadapter.NewCachedUserIdentityReader(readCache, reelWriter.UserExists)
+	httpapi.RegisterInteractionReadRoutes(router, logger, cachedUsers, usecase.NewInteractionReads(cachedInteractions, cachedInteractions))
+
 	server := &http.Server{
 		Addr:              cfg.HTTPAddr,
 		Handler:           router,
