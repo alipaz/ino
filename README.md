@@ -19,9 +19,9 @@ Use `docker compose up --build` after changing Go code or SQL migrations.
 The API listens at `http://127.0.0.1:8080`. PostgreSQL and Redis are reachable
 as `postgres:5432` and `redis:6379` inside the Compose network; neither publishes
 a host port. Once PostgreSQL is healthy, the one-shot `migrate` service applies
-pending Goose migrations. The API starts after migration success and checks
-its PostgreSQL connection before listening. It can start and serve requests
-while Redis is unavailable.
+pending Goose migrations. The one-shot `seed` service then populates a fresh
+database. The API and read projector start after seed succeeds or skips an
+existing database. Redis is optional for API startup and requests.
 
 ## Configuration
 
@@ -53,8 +53,8 @@ new data volume; existing roles/passwords must be changed in PostgreSQL itself.
 excluded from the Docker build context. Commit only example credentials.
 
 For a host Go run (Go 1.25+), supply `DATABASE_URL` for a PostgreSQL instance
-reachable from the host, run `go run ./cmd/migrate up`, then run `go run ./cmd/api`. The application requires
-that variable and defaults `HTTP_ADDR` to `:8080`; Compose fixes the internal
+reachable from the host, run `go run ./cmd/migrate up`, then
+`go run ./cmd/seed` and `go run ./cmd/api`. The API defaults `HTTP_ADDR` to `:8080`; Compose fixes the internal
 address at `:8080`. `.env` is read by Compose, not by the Go binary.
 
 The build pins Go 1.25.4 and Alpine 3.22.2; Compose pins PostgreSQL 18.6 and
@@ -79,6 +79,42 @@ docker compose logs migrate
 docker compose run --rm migrate status
 docker compose run --rm --build migrate up
 ```
+
+## Assessment demo
+
+A fresh Compose database receives 24 creators, 240 reels (200 published,
+20 drafts, and 20 archived), 120 products, 30 users, and 1,448 like, save,
+and counted-view rows. It also includes six shares and nine final-watch
+sessions. Media URLs are synthetic placeholders. The available categories are
+`outdoors`, `style`, `home-goods`, `tech`, `fitness`, and `drinkware`.
+
+The seed takes a transaction-level PostgreSQL lock to serialize concurrent
+runs. It skips if it finds any application rows. It verifies the dataset
+and reel counters before committing, and the existing activity hooks record
+the seeded actions. `docker compose down` retains the volume. A later
+`docker compose up` skips the seed on that volume.
+
+Try `X-User-ID: 1` for outdoors, `X-User-ID: 2` for style, and
+`X-User-ID: 3` for a viewer without history. These IDs apply to a fresh demo
+volume.
+
+```sh
+curl -H 'X-User-ID: 1' 'http://127.0.0.1:8080/api/v1/feed?limit=10'
+curl -H 'X-User-ID: 2' 'http://127.0.0.1:8080/api/v1/feed?limit=10'
+curl 'http://127.0.0.1:8080/api/v1/feed?category=outdoors&limit=10'
+```
+
+Copy `next_cursor` from a response and repeat its viewer and category. For
+the public outdoors example:
+
+```sh
+NEXT_CURSOR='<paste next_cursor here>'
+curl -G 'http://127.0.0.1:8080/api/v1/feed' \
+  --data-urlencode 'category=outdoors' --data-urlencode 'limit=10' \
+  --data-urlencode "cursor=$NEXT_CURSOR"
+```
+
+Inspect seed status with `docker compose logs seed`.
 
 ## Explore feed
 
@@ -145,9 +181,11 @@ ID descending.
 Identity, first-page ordering, and materialized pages use Redis first. A
 complete warm request makes zero PostgreSQL queries. Ordering lasts up to
 15 seconds, and page content lasts up to 10 seconds. Committed catalog events
-invalidate both. Committed activity events also invalidate first-page orders
-through the projector. Watch reports that emit no outbox event may take up to
-the order TTL to affect a new browse. Cached pages may briefly lag publication
+invalidate both. An activity event refreshes only that viewer's first-page
+order across categories. Guests and other viewers can reflect global
+engagement changes when their orders expire. Counted views still appear in
+recent activity even though they have zero ranking weight. Watch reports
+without an outbox event affect a new browse when its cached order expires. Cached pages may briefly lag publication
 or category edits until invalidation arrives or their TTL expires. Page fields
 such as counters and creator names can lag until the page TTL expires.
 
@@ -167,8 +205,8 @@ A published reel returns HTTP 200 and `{"products":[...]}`. Each product has
 `id`, `title`, `brand`, `image_url`, `price` (USD cents), and `category`
 (a lowercase slug). Results are ordered by display position, then by product
 ID, both ascending. A published reel with no products returns
-`{"products":[]}`. A fresh database has no fixture rows, so the example
-request returns 404 until reel 1 is inserted and published.
+`{"products":[]}`. The example returns products for seeded reel 1 on a fresh
+Compose installation.
 
 | Status | Meaning |
 | --- | --- |

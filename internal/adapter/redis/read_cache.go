@@ -21,6 +21,7 @@ const (
 	cachePrefix     = "ino:cache:v1:"
 	catalogEpochKey = cachePrefix + "catalog"
 	fallbackTimeout = 750 * time.Millisecond
+	scopedEpochTTL  = time.Minute
 	productsTTL     = 15 * time.Second
 	stateTTL        = 10 * time.Second
 	identityTTL     = 15 * time.Second
@@ -42,12 +43,16 @@ func NewReadCache(client *goredis.Client, timeout time.Duration, maxFallbacks in
 }
 
 type cacheKey struct {
-	name     string
-	kind     string
-	epochKey string
+	name          string
+	kind          string
+	epochKey      string
+	scopeEpochKey string
 }
 
 func (key cacheKey) redisKeys() []string {
+	if key.scopeEpochKey != "" {
+		return []string{key.name, key.epochKey, key.scopeEpochKey}
+	}
 	if key.epochKey != "" {
 		return []string{key.name, key.epochKey}
 	}
@@ -61,21 +66,31 @@ type cacheRead struct {
 }
 
 // A miss reserves a generation before the PostgreSQL read starts. A shared
-// epoch invalidates related entries without scanning keys.
+// epoch invalidates related entries without scanning keys. Feed orders may
+// also depend on a short-lived viewer epoch.
 var readScript = goredis.NewScript(`
 local epoch = ''
-if #KEYS == 2 then
+if #KEYS >= 2 then
     epoch = redis.call('GET', KEYS[2])
     if not epoch then
         epoch = ARGV[1]
         redis.call('SET', KEYS[2], epoch)
     end
 end
+if #KEYS == 3 then
+    local scope = redis.call('GET', KEYS[3])
+    if not scope then
+        scope = ARGV[1]
+        redis.call('SET', KEYS[3], scope, 'PX', ARGV[3])
+    end
+    epoch = epoch .. ':' .. scope
+end
 local entry = redis.call('HMGET', KEYS[1], 'generation', 'epoch', 'value')
 if not entry[1] or entry[2] ~= epoch then
     redis.call('DEL', KEYS[1])
     redis.call('HSET', KEYS[1], 'generation', ARGV[1], 'epoch', epoch)
     redis.call('PEXPIRE', KEYS[1], ARGV[2])
+    if #KEYS == 3 then redis.call('PEXPIRE', KEYS[3], ARGV[3]) end
     return {ARGV[1], epoch, ''}
 end
 return {entry[1], epoch, entry[3] or ''}
@@ -90,7 +105,17 @@ const (
 )
 
 var fillScript = goredis.NewScript(`
-if #KEYS == 2 and redis.call('GET', KEYS[2]) ~= ARGV[2] then return 0 end
+local epoch = ''
+if #KEYS >= 2 then
+    epoch = redis.call('GET', KEYS[2])
+    if not epoch then return 0 end
+end
+if #KEYS == 3 then
+    local scope = redis.call('GET', KEYS[3])
+    if not scope then return 0 end
+    epoch = epoch .. ':' .. scope
+end
+if epoch ~= ARGV[2] then return 0 end
 local entry = redis.call('HMGET', KEYS[1], 'generation', 'value')
 if entry[1] ~= ARGV[1] then return 0 end
 if entry[2] == ARGV[4] then return 2 end
@@ -103,7 +128,7 @@ return 1
 func (cache *ReadCache) read(ctx context.Context, key cacheKey) (cacheRead, error) {
 	ctx, cancel := context.WithTimeout(ctx, cache.timeout)
 	defer cancel()
-	parts, err := readScript.Run(ctx, cache.client, key.redisKeys(), rand.Text(), (5 * time.Second).Milliseconds()).StringSlice()
+	parts, err := readScript.Run(ctx, cache.client, key.redisKeys(), rand.Text(), (5 * time.Second).Milliseconds(), scopedEpochTTL.Milliseconds()).StringSlice()
 	if err != nil {
 		return cacheRead{}, err
 	}

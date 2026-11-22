@@ -5,13 +5,13 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"fmt"
+	"strconv"
 	"time"
 
 	"ino/internal/domain"
 )
 
 const (
-	feedEpochKey = cachePrefix + "feed:order-epoch"
 	feedOrderTTL = 15 * time.Second
 	feedPageTTL  = 10 * time.Second
 )
@@ -32,7 +32,10 @@ func NewCachedFeedReader(cache *ReadCache, source FeedPageSource) *CachedFeedRea
 func (reader *CachedFeedReader) ReadFeedOrder(ctx context.Context, viewerID int64, category, rankingVersion string, load func(context.Context) ([]int64, error)) ([]int64, error) {
 	key := cacheKey{
 		name: fmt.Sprintf("%sfeed:order:%s:%d:%s", cachePrefix, rankingVersion, viewerID, category),
-		kind: "feed_order", epochKey: feedEpochKey,
+		kind: "feed_order", epochKey: catalogEpochKey,
+	}
+	if viewerID != 0 {
+		key.scopeEpochKey = feedViewerEpochKey(viewerID)
 	}
 	return cachedRead(ctx, reader.cache, key, feedOrderTTL, validFeedOrder, func(ctx context.Context) ([]int64, error) {
 		ids, err := load(ctx)
@@ -41,6 +44,10 @@ func (reader *CachedFeedReader) ReadFeedOrder(ctx context.Context, viewerID int6
 		}
 		return ids, err
 	})
+}
+
+func feedViewerEpochKey(viewerID int64) string {
+	return cachePrefix + "feed:viewer-epoch:" + strconv.FormatInt(viewerID, 10)
 }
 
 func validFeedOrder(ids []int64) bool {

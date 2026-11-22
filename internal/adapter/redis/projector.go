@@ -31,13 +31,12 @@ func (projector *RecentInteractionProjector) Apply(ctx context.Context, changes 
 		switch change.Kind {
 		case "catalog":
 			invalidations[catalogEpochKey] = struct{}{}
-			invalidations[feedEpochKey] = struct{}{}
 		case "state":
 			invalidations[interactionKey(change.UserID, change.ReelID).name] = struct{}{}
 		case "identity":
 			invalidations[identityKey(change.UserID).name] = struct{}{}
 		case "activity":
-			invalidations[feedEpochKey] = struct{}{}
+			invalidations[feedViewerEpochKey(change.UserID)] = struct{}{}
 			key := recentKey(change.UserID)
 			invalidations[key.name] = struct{}{}
 			activityUsers[change.UserID] = struct{}{}

@@ -9,19 +9,19 @@ import (
 )
 
 func productKey(reelID int64) cacheKey {
-	return cacheKey{cachePrefix + "products:" + strconv.FormatInt(reelID, 10), "products", catalogEpochKey}
+	return cacheKey{name: cachePrefix + "products:" + strconv.FormatInt(reelID, 10), kind: "products", epochKey: catalogEpochKey}
 }
 
 func interactionKey(userID, reelID int64) cacheKey {
-	return cacheKey{cachePrefix + "state:" + strconv.FormatInt(userID, 10) + ":" + strconv.FormatInt(reelID, 10), "interaction_state", catalogEpochKey}
+	return cacheKey{name: cachePrefix + "state:" + strconv.FormatInt(userID, 10) + ":" + strconv.FormatInt(reelID, 10), kind: "interaction_state", epochKey: catalogEpochKey}
 }
 
 func recentKey(userID int64) cacheKey {
-	return cacheKey{cachePrefix + "recent:" + strconv.FormatInt(userID, 10), "recent_activity", ""}
+	return cacheKey{name: cachePrefix + "recent:" + strconv.FormatInt(userID, 10), kind: "recent_activity"}
 }
 
 func identityKey(userID int64) cacheKey {
-	return cacheKey{cachePrefix + "identity:" + strconv.FormatInt(userID, 10), "identity", ""}
+	return cacheKey{name: cachePrefix + "identity:" + strconv.FormatInt(userID, 10), kind: "identity"}
 }
 
 type CachedReelProductReader struct {

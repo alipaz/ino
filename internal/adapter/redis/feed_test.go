@@ -21,7 +21,7 @@ func TestFeedSharesFallbackBudgetWithIdentityRedis(t *testing.T) {
 	})
 	t.Cleanup(func() {
 		_ = readCache.client.Del(context.Background(),
-			cachePrefix+"feed:order:test:987:budget-test", identityKey(987).name, feedEpochKey).Err()
+			cachePrefix+"feed:order:test:987:budget-test", identityKey(987).name, catalogEpochKey, feedViewerEpochKey(987)).Err()
 	})
 
 	started, release := make(chan struct{}), make(chan struct{})

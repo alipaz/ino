@@ -31,7 +31,6 @@ later prompt before implementation:
 | Endpoint behavior | Contracts for any later features |
 | Concurrency | Future feature transaction boundaries |
 | Redis usage | Caching and invalidation policy for future features |
-| Final automation | Seed command, startup ordering for seed data and reproducibility |
 
 Each prompt settles only the part of this contract it authorizes. Retain prior
 decisions unless the user explicitly changes them.
@@ -168,9 +167,34 @@ A signed cursor freezes the order of up to 200 reels for 10 minutes and is
 bound to its viewer and category. Invalid cursors return 400 and expired
 cursors return 410. Continuation pages keep the original order through
 ranking changes and Redis outages. Details skip reels that no longer qualify.
-Redis holds short-lived identity, order, and page entries. Catalog and activity
-projection invalidate relevant entries. Fallback uses the existing shared
+Redis holds short-lived identity, order, and page entries. Catalog projection invalidates all affected order and page entries. Activity
+projection invalidates only the actor's first-page orders. Fallback uses the existing shared
 PostgreSQL limits and returns 503 when unavailable or overloaded.
 
-This phase uses the existing schema, watch API and persistence. The full
-assessment seed remains a later deliverable.
+This phase uses the existing schema, watch API and persistence.
+
+## Assessment delivery
+
+**Complete (2026-11-23).** Go tests, vet, Compose configuration, and the
+disposable PostgreSQL and Redis integration suites passed. Isolated Compose
+startup verified the seeded demo and a same-volume relaunch skipped seeding.
+The cache regression verified unrelated hits and rejection of stale fills.
+
+Compose starts `seed` after Goose migrations complete. The API and projector
+wait for seed success, including a successful skip when any application
+data already exists. A transaction and advisory lock protect the fresh
+install. It verifies required dataset sizes and matches reel counters to
+the actual like, save, and counted-view rows before committing.
+
+The fresh demo contains 24 creators, 240 reels across all publication
+states, 120 products in six categories, and 1,448 actual interaction rows.
+Synthetic users 1 and 2 have different category interests. User 3 has
+no history. See the [assessment demo](../README.md#assessment-demo) for
+categories and a second-page request.
+
+Catalog invalidation covers every viewer and the public feed. Activity
+invalidates only the actor's feed-order epoch across categories and
+preserves the recent-activity and interaction-state paths. Other viewers
+and guests may see global engagement changes after the existing 15-second
+order TTL. Viewer and catalog epochs both guard stale fills. Signed
+continuations keep their original order.

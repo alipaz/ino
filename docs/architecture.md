@@ -18,7 +18,7 @@ PostgreSQL catalog and write paths. The feed runs inside the API process.
 | `internal/usecase/` | Catalog and interaction reads, writes, and consumer interfaces | Implemented |
 | `internal/adapter/redis/` | Redis read decorators, share receipts, and the activity projector | Implemented |
 | `migrations/` | Versioned Goose SQL and embedded migration files | Implemented |
-| `cmd/seed/` | Reproducible assessment seed entry point | Future; decide implementation later |
+| `cmd/seed/` | One-shot entry point for transactional assessment seeding | Implemented |
 | `docs/` | Architecture, assessment contract and phase history | Implemented |
 
 ## Dependency direction
@@ -42,9 +42,10 @@ use-case interfaces expose domain results without referring to Redis or pgx.
    check and named data volume. Only the API publishes a host port.
 2. After PostgreSQL becomes healthy over TCP, Compose runs `migrate` with the
    same database URL as `api`. Goose applies pending SQL migrations and tracks
-   versions. Both `api` and `read-projector` wait for migration success and healthy
-   PostgreSQL. They start independently. Redis has its own health check
-   and is optional for API startup.
+   versions. The `seed` command runs next, using the same database URL.
+   It serializes with other seed runs and commits only a validated dataset
+   on an empty schema. Both `api` and `read-projector` wait for seed success
+   and healthy PostgreSQL. Redis is optional for API startup.
 3. The executable validates environment configuration and initializes JSON
    `slog` logging. It installs SIGINT/SIGTERM cancellation before database startup.
 4. The PostgreSQL adapter parses `DATABASE_URL`, creates a pool capped at ten
@@ -173,8 +174,11 @@ uses cursor ordinality and current eligibility to fetch creators and products
 without one call per reel.
 
 The Redis adapter uses the shared read limiter and coalescing for feed order
-and materialized page keys. The projector invalidates a feed-order epoch for
-catalog or activity changes, and pages share the catalog epoch. The signed
+and materialized page keys. Both depend on the catalog epoch. Signed-in
+feed orders also depend on a short-lived viewer epoch. Activity deletes that
+viewer's epoch across all categories without scanning keys. Fills compare
+both epochs for those orders. Public orders and other viewers learn about
+global engagement changes as their order TTL expires. The signed
 cursor contains the ordered IDs, viewer, category, position and expiry, so
 continuations need only page data. See the [feed guide](../README.md#explore-feed)
 for the ranking and pagination contracts.
