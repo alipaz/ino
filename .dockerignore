@@ -1,0 +1,16 @@
+.git
+.env
+.env.*
+*.env
+secrets
+*.pem
+*.key
+bin
+coverage.out
+*.test
+.DS_Store
+.idea
+.vscode
+docs
+README.md
+AGENTS.md
