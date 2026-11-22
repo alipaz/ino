@@ -1,7 +1,7 @@
 # INO Explore
 
-A Go backend with Gin, PostgreSQL, Redis and Docker Compose. This phase adds
-Redis-backed reads and share receipt replay, plus durable recent activity.
+A Go backend with Gin, PostgreSQL, Redis and Docker Compose. INO Explore
+serves a ranked reel feed with optional personalization and cursor pagination.
 
 Read [the project contract](docs/project-contract.md),
 [architecture](docs/architecture.md) and [agent instructions](AGENTS.md) before
@@ -43,6 +43,7 @@ docker compose up --build
 | `DB_STARTUP_TIMEOUT` | `30s` | Maximum PostgreSQL startup wait |
 | `REDIS_URL` | Compose `redis://redis:6379/0` | Redis endpoint. For a host run, leave it empty to use PostgreSQL only. |
 | `CACHE_REDIS_TIMEOUT` | `50ms` | Deadline per Redis operation |
+| `FEED_CURSOR_SECRET` | Random per process | Signing key of at least 32 bytes. Set the same secret across API instances and restarts to preserve cursors. |
 | `LOG_LEVEL` | `info` | `debug` includes cache hit, miss, fallback, and projector lag logs |
 
 When changing `POSTGRES_*`, update `DATABASE_URL` to match and URI-encode reserved
@@ -78,6 +79,82 @@ docker compose logs migrate
 docker compose run --rm migrate status
 docker compose run --rm --build migrate up
 ```
+
+## Explore feed
+
+```sh
+curl 'http://127.0.0.1:8080/api/v1/feed?limit=20'
+curl -H 'X-User-ID: 1' 'http://127.0.0.1:8080/api/v1/feed?category=outdoors&limit=10'
+curl -G -H 'X-User-ID: 1' 'http://127.0.0.1:8080/api/v1/feed' \
+  --data-urlencode 'category=outdoors' --data-urlencode 'limit=10' \
+  --data-urlencode "cursor=$NEXT_CURSOR"
+```
+
+Use an existing user ID for personalization. Omit the header for the public
+feed. An invalid identity returns 401. Users without useful signals receive
+public ranking. Category is a lowercase slug of at most 64 ASCII characters.
+A matching published reel may have products in other categories, and its
+response includes all attached products in display order. Feed items also
+include creator, duration, and reel counters. An empty response is
+`{"items":[],"next_cursor":null}`.
+
+The default limit is 20 and the maximum is 50. Invalid parameters and
+cursors return 400. An expired cursor returns 410. Use the same viewer and
+category throughout a browse. A signed cursor freezes up to 200 ordered IDs
+for 10 minutes from the first page. Its maximum encoded size is 2,291 bytes.
+Continuation pages keep those IDs even if ranking changes or Redis is
+unavailable. They skip reels that are no longer published or no longer
+match the filter and advance past skipped positions. The feed does not
+append newly eligible reels to an existing browse.
+
+### Ranking V1 and final watch reports
+
+V1 project heuristics are share **+5**, active save **+4**, quality watch
+**+3**, active like **+2**, simple view **0**, and quick skip **−2**.
+Candidates come from freshness, the unweighted sum of active likes and saves
+for popular discovery, and up to five strongest positive categories. V1
+weights apply after discovery. Public discovery reserves
+100 fresh and 100 popular positions. Personalized discovery with preferred
+categories reserves 70 fresh, 70 popular, and 60 category positions.
+Buckets can overlap, so the deduplicated set may contain fewer than 200.
+
+Global shares are deduplicated by sender and reel. The ranking input uses
+the maximum stored watch time per user and reel. A watch below 20% is a
+quick skip, 20% through just under 70% is neutral, and 70% or above is a
+quality watch. The thresholds are evaluated without rounding percentages.
+The client sends its final cumulative `watched_ms` to the existing
+`PUT /api/v1/reels/{id}/watch-sessions/{playback_id}` when leaving the reel.
+It sends no interim reports and reuses the playback ID for retries. The
+existing `watch_interest` event adds no separate ranking signal.
+
+Signed engagement is normalized with
+`sign(score) * log1p(min(abs(score), 100)) / log1p(100)`. Freshness decays
+with a 48-hour half-life. The base score is 55% freshness and 45% normalized
+engagement. Personalization uses up to 100 recent activity events with a
+seven-day half-life. A removal cancels the corresponding active like or save.
+Untimestamped watch preferences are separate, weighted at 0.5, and drawn from
+up to 100 watched reels ordered by reel creation time and ID. Signals split
+across distinct categories. Affinities are normalized by the largest absolute
+category total, and a candidate uses the mean of its category affinities.
+The personal weight is the lesser of 0.35 and 0.07 times the number of reels
+with a useful nonzero signal. Scores sort descending, then creation time and
+ID descending.
+
+### Feed cache behavior
+
+Identity, first-page ordering, and materialized pages use Redis first. A
+complete warm request makes zero PostgreSQL queries. Ordering lasts up to
+15 seconds, and page content lasts up to 10 seconds. Committed catalog events
+invalidate both. Committed activity events also invalidate first-page orders
+through the projector. Watch reports that emit no outbox event may take up to
+the order TTL to affect a new browse. Cached pages may briefly lag publication
+or category edits until invalidation arrives or their TTL expires. Page fields
+such as counters and creator names can lag until the page TTL expires.
+
+Redis misses and failures fall back to bounded, coalesced PostgreSQL reads.
+If a fallback cannot be admitted or PostgreSQL is unavailable, the request
+returns 503. Redis is optional at startup. [Redis behavior and freshness](#redis-behavior-and-freshness)
+describes the shared fallback limits and verification setup.
 
 ## List products for a published reel
 

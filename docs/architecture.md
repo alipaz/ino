@@ -1,7 +1,7 @@
 # Architecture
 
 The cache phase adds Redis-backed reads and share receipts to the existing
-PostgreSQL catalog and write paths.
+PostgreSQL catalog and write paths. The feed runs inside the API process.
 
 ## Directory map
 
@@ -13,6 +13,7 @@ PostgreSQL catalog and write paths.
 | `internal/config/` | Environment defaults and validation | Implemented |
 | `internal/transport/httpapi/` | Gin router, health and reel responses, activity reads, request/panic logging | Implemented |
 | `internal/adapter/postgres/` | pgxpool lifecycle, catalog and activity reads, writes, and outbox claiming | Implemented |
+| `internal/ranking/` | Pure Go ranking rules, score composition, and deterministic ordering | Implemented |
 | `internal/domain/` | Products, interactions, shares, and activity events | Implemented |
 | `internal/usecase/` | Catalog and interaction reads, writes, and consumer interfaces | Implemented |
 | `internal/adapter/redis/` | Redis read decorators, share receipts, and the activity projector | Implemented |
@@ -161,6 +162,22 @@ by sender and idempotency key. After request validation, a hit compares reel
 and recipient before replaying the receipt. On a miss PostgreSQL keeps the
 existing authoritative uniqueness and conflict handling. See the
 [README](../README.md#redis-behavior-and-freshness) for TTLs and failure behavior.
+
+## Explore feed
+
+The feed use case composes batched PostgreSQL queries, the pure V1 ranker,
+and an authenticated cursor. The first read loads activity and watch inputs
+only on a cold personalized order. Discovery selects bounded fresh, popular,
+and category buckets before aggregating global share and watch facts. Page SQL
+uses cursor ordinality and current eligibility to fetch creators and products
+without one call per reel.
+
+The Redis adapter uses the shared read limiter and coalescing for feed order
+and materialized page keys. The projector invalidates a feed-order epoch for
+catalog or activity changes, and pages share the catalog epoch. The signed
+cursor contains the ordered IDs, viewer, category, position and expiry, so
+continuations need only page data. See the [feed guide](../README.md#explore-feed)
+for the ranking and pagination contracts.
 
 ## References
 

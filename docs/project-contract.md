@@ -27,11 +27,9 @@ later prompt before implementation:
 
 | Area | Decisions still needed |
 | --- | --- |
-| Schema details | Feed indexes and schema for later features |
-| Feed ranking | Formula, inputs, tie-breakers and how interactions change scores |
-| Cursor stability | Encoding, ordering, snapshot/change semantics and duplicates/omissions between pages |
-| Endpoint behavior | Feed routes, payloads, validation, filtering, pagination bounds and identity |
-| Concurrency | Feed consistency and future feature transaction boundaries |
+| Schema details | Indexes and schema for later features |
+| Endpoint behavior | Contracts for any later features |
+| Concurrency | Future feature transaction boundaries |
 | Redis usage | Caching and invalidation policy for future features |
 | Final automation | Seed command, startup ordering for seed data and reproducibility |
 
@@ -142,3 +140,37 @@ writes, and Redis outages.
 
 Feed ranking, ordering, pagination, personalization, messaging, and
 notifications remain outside this phase.
+
+## Explore feed phase
+
+**Complete (2026-11-23).** Go tests, vet, Compose configuration, and disposable
+PostgreSQL and Redis integration suites passed. Warm public and authenticated
+GETs made zero PostgreSQL queries. An isolated Compose run retained cursor
+order after ranking and eligibility changed, including while Redis was stopped.
+
+`GET /api/v1/feed` lists published reels with creator details, counters, and
+all products. Category filters match any attached product. The route defaults
+to 20 items and accepts up to 50. Omit `X-User-ID` for the public feed. Valid
+viewers with useful signals receive personalization. Invalid identity returns
+401.
+
+V1 weights are share +5, active save +4, quality watch +3, active like +2,
+simple view 0, and quick skip −2. Global ranking uses a signed logarithmic
+engagement scale and 48-hour freshness half-life at 45% and 55%. The ranker
+blends this with category affinity using up to 35% personal weight. The client
+sends a final cumulative watch report when leaving a reel and reuses the
+playback ID for retries. Scoring uses the maximum watch time per user and
+reel. Watch signals are separate from the chronological activity history,
+with boundaries at 20% and 70%. See the [feed guide](../README.md#explore-feed)
+for exact formulas and request examples.
+
+A signed cursor freezes the order of up to 200 reels for 10 minutes and is
+bound to its viewer and category. Invalid cursors return 400 and expired
+cursors return 410. Continuation pages keep the original order through
+ranking changes and Redis outages. Details skip reels that no longer qualify.
+Redis holds short-lived identity, order, and page entries. Catalog and activity
+projection invalidate relevant entries. Fallback uses the existing shared
+PostgreSQL limits and returns 503 when unavailable or overloaded.
+
+This phase uses the existing schema, watch API and persistence. The full
+assessment seed remains a later deliverable.

@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -17,6 +18,7 @@ import (
 	"ino/internal/adapter/postgres"
 	cacheadapter "ino/internal/adapter/redis"
 	"ino/internal/config"
+	"ino/internal/ranking"
 	"ino/internal/transport/httpapi"
 	"ino/internal/usecase"
 )
@@ -44,6 +46,18 @@ func start() int {
 }
 
 func run(ctx context.Context, cfg config.Config, logger *slog.Logger) error {
+	cursorSecret := []byte(cfg.FeedCursorSecret)
+	if len(cursorSecret) == 0 {
+		cursorSecret = make([]byte, 32)
+		if _, err := rand.Read(cursorSecret); err != nil {
+			return fmt.Errorf("generate feed cursor secret: %w", err)
+		}
+	}
+	feedCursor, err := usecase.NewFeedCursor(cursorSecret)
+	if err != nil {
+		return err
+	}
+
 	startupCtx, cancel := context.WithTimeout(ctx, cfg.DBStartupTimeout)
 	logger.Info("waiting for PostgreSQL")
 	pool, err := postgres.Open(startupCtx, cfg.DatabaseURL)
@@ -80,6 +94,12 @@ func run(ctx context.Context, cfg config.Config, logger *slog.Logger) error {
 	cachedInteractions := cacheadapter.NewCachedInteractionReader(readCache, interactionReader, interactionReader)
 	cachedUsers := cacheadapter.NewCachedUserIdentityReader(readCache, reelWriter.UserExists)
 	httpapi.RegisterInteractionReadRoutes(router, logger, cachedUsers, usecase.NewInteractionReads(cachedInteractions, cachedInteractions))
+
+	feedSource := postgres.NewFeedReader(pool)
+	cachedFeed := cacheadapter.NewCachedFeedReader(readCache, feedSource)
+	feedRanker := ranking.NewWeightedFeedRanker(ranking.V1Policy())
+	feed := usecase.NewFeed(feedSource, feedRanker, cachedFeed, cachedFeed, feedCursor)
+	httpapi.RegisterFeedRoutes(router, logger, cachedUsers, feed)
 
 	server := &http.Server{
 		Addr:              cfg.HTTPAddr,

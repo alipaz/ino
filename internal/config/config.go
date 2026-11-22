@@ -14,6 +14,7 @@ type Config struct {
 	HTTPAddr          string
 	DatabaseURL       string
 	RedisURL          string
+	FeedCursorSecret  string
 	CacheRedisTimeout time.Duration
 	DBStartupTimeout  time.Duration
 	LogLevel          slog.Level
@@ -24,6 +25,7 @@ func Load() (Config, error) {
 		HTTPAddr:         value("HTTP_ADDR", ":8080"),
 		DatabaseURL:      os.Getenv("DATABASE_URL"),
 		RedisURL:         os.Getenv("REDIS_URL"),
+		FeedCursorSecret: os.Getenv("FEED_CURSOR_SECRET"),
 		DBStartupTimeout: 30 * time.Second,
 	}
 	if cfg.DatabaseURL == "" {

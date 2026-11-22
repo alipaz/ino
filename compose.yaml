@@ -11,6 +11,7 @@ services:
       DB_STARTUP_TIMEOUT: "${DB_STARTUP_TIMEOUT:-30s}"
       REDIS_URL: "${REDIS_URL-redis://redis:6379/0}"
       CACHE_REDIS_TIMEOUT: "${CACHE_REDIS_TIMEOUT:-50ms}"
+      FEED_CURSOR_SECRET: "${FEED_CURSOR_SECRET:-}"
       LOG_LEVEL: "${LOG_LEVEL:-info}"
     ports:
       - "127.0.0.1:${API_PORT:-8080}:8080"

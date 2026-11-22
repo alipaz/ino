@@ -35,8 +35,8 @@ func TestCoalescesSameKeyAndBoundsFallbacksRedis(t *testing.T) {
 	cache := openTestReadCache(t, 1)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	key := cacheKey{cachePrefix + "test:coalesce", "test", false}
-	other := cacheKey{cachePrefix + "test:overload", "test", false}
+	key := cacheKey{cachePrefix + "test:coalesce", "test", ""}
+	other := cacheKey{cachePrefix + "test:overload", "test", ""}
 	t.Cleanup(func() { _ = cache.client.Del(context.Background(), key.name, other.name).Err() })
 
 	started := make(chan struct{})
@@ -87,13 +87,13 @@ func TestOlderFillCannotRestoreInvalidatedEntryRedis(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	for _, key := range []cacheKey{
-		{cachePrefix + "test:user-state", "test", false},
-		{cachePrefix + "test:catalog", "test", true},
+		{cachePrefix + "test:user-state", "test", ""},
+		{cachePrefix + "test:catalog", "test", catalogEpochKey},
 	} {
 		t.Run(key.name, func(t *testing.T) {
 			invalidation := key.name
-			if key.catalogDependent {
-				invalidation = catalogEpochKey
+			if key.epochKey != "" {
+				invalidation = key.epochKey
 			}
 			t.Cleanup(func() { _ = cache.client.Del(context.Background(), key.name, invalidation).Err() })
 			readBeforeWrite, err := cache.read(ctx, key)

@@ -42,14 +42,14 @@ func NewReadCache(client *goredis.Client, timeout time.Duration, maxFallbacks in
 }
 
 type cacheKey struct {
-	name             string
-	kind             string
-	catalogDependent bool
+	name     string
+	kind     string
+	epochKey string
 }
 
 func (key cacheKey) redisKeys() []string {
-	if key.catalogDependent {
-		return []string{key.name, catalogEpochKey}
+	if key.epochKey != "" {
+		return []string{key.name, key.epochKey}
 	}
 	return []string{key.name}
 }
@@ -60,8 +60,8 @@ type cacheRead struct {
 	value      string
 }
 
-// A miss reserves a generation before the PostgreSQL read starts. A catalog
-// epoch invalidates both products and reel visibility without scanning keys.
+// A miss reserves a generation before the PostgreSQL read starts. A shared
+// epoch invalidates related entries without scanning keys.
 var readScript = goredis.NewScript(`
 local epoch = ''
 if #KEYS == 2 then
