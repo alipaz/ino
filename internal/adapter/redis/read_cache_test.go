@@ -31,6 +31,87 @@ func openTestReadCache(t *testing.T, slots int) *ReadCache {
 	return NewReadCache(client, 250*time.Millisecond, slots, slog.New(slog.NewTextHandler(io.Discard, nil)))
 }
 
+func TestPostgresReadWaitsForBrieflyBusySlot(t *testing.T) {
+	cache := NewReadCache(nil, time.Second, 1, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	cache.fallbacks <- struct{}{}
+
+	result := make(chan error, 1)
+	go func() {
+		_, err := readPostgres(ctx, cache, "test", func(context.Context) (int, error) {
+			return 42, nil
+		})
+		result <- err
+	}()
+	waitForQueuedRead(t, cache, result)
+	<-cache.fallbacks
+	if err := <-result; err != nil {
+		t.Fatalf("read after releasing a PostgreSQL slot: %v", err)
+	}
+}
+
+func TestPostgresReadCancelsWhileWaiting(t *testing.T) {
+	cache := NewReadCache(nil, time.Second, 1, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	cache.fallbacks <- struct{}{}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	result := make(chan error, 1)
+	go func() {
+		_, err := readPostgres(ctx, cache, "test", func(context.Context) (int, error) {
+			t.Error("canceled read ran a query")
+			return 0, nil
+		})
+		result <- err
+	}()
+	waitForQueuedRead(t, cache, result)
+	cancel()
+	if err := <-result; !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled read: %v", err)
+	}
+	if len(cache.waiters) != 0 || len(cache.fallbacks) != 1 {
+		t.Fatal("canceled read did not release its waiting slot or changed the active budget")
+	}
+}
+
+func TestPostgresReadRejectsFullQueue(t *testing.T) {
+	cache := NewReadCache(nil, time.Second, 4, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if cap(cache.waiters) != 16 {
+		t.Fatalf("read queue capacity = %d, want 16", cap(cache.waiters))
+	}
+	for range cap(cache.fallbacks) {
+		cache.fallbacks <- struct{}{}
+	}
+	for range cap(cache.waiters) {
+		cache.waiters <- struct{}{}
+	}
+	_, err := readPostgres(context.Background(), cache, "test", func(context.Context) (int, error) {
+		t.Fatal("read ran with all active and waiting slots occupied")
+		return 0, nil
+	})
+	if !errors.Is(err, usecase.ErrReadUnavailable) {
+		t.Fatalf("read with a full queue: %v", err)
+	}
+}
+
+func waitForQueuedRead(t *testing.T, cache *ReadCache, result <-chan error) {
+	t.Helper()
+	poll := time.NewTicker(time.Millisecond)
+	defer poll.Stop()
+	timeout := time.NewTimer(time.Second)
+	defer timeout.Stop()
+	for len(cache.waiters) == 0 {
+		select {
+		case err := <-result:
+			t.Fatalf("read finished before waiting for a slot: %v", err)
+		case <-timeout.C:
+			t.Fatal("read never waited for a slot")
+		case <-poll.C:
+		}
+	}
+}
+
 func TestCoalescesSameKeyAndBoundsFallbacksRedis(t *testing.T) {
 	cache := openTestReadCache(t, 1)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)

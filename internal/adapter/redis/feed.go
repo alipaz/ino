@@ -2,8 +2,6 @@ package redis
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/binary"
 	"fmt"
 	"strconv"
 	"time"
@@ -11,10 +9,7 @@ import (
 	"ino/internal/domain"
 )
 
-const (
-	feedOrderTTL = 15 * time.Second
-	feedPageTTL  = 10 * time.Second
-)
+const feedOrderTTL = 15 * time.Second
 
 type FeedPageSource interface {
 	LoadFeedPage(ctx context.Context, category string, orderedIDs []int64, limit int) (domain.FeedPage, error)
@@ -64,24 +59,10 @@ func validFeedOrder(ids []int64) bool {
 	return true
 }
 
-func (reader *CachedFeedReader) ReadFeedPage(ctx context.Context, viewerID int64, category, rankingVersion string, orderedIDs []int64, limit int) (domain.FeedPage, error) {
-	encodedIDs := make([]byte, 0, len(orderedIDs)*8)
-	for _, id := range orderedIDs {
-		encodedIDs = binary.BigEndian.AppendUint64(encodedIDs, uint64(id))
-	}
-	digest := sha256.Sum256(encodedIDs)
-	key := cacheKey{
-		name: fmt.Sprintf("%sfeed:page:%s:%d:%s:%d:%x", cachePrefix, rankingVersion, viewerID, category, limit, digest),
-		kind: "feed_page", epochKey: catalogEpochKey,
-	}
-	return cachedRead(ctx, reader.cache, key, feedPageTTL, func(page domain.FeedPage) bool {
-		return page.Items != nil && len(page.Items) <= limit && page.Consumed >= len(page.Items) &&
-			page.Consumed <= len(orderedIDs) && (page.Consumed == len(orderedIDs) || len(page.Items) == limit)
-	}, func(ctx context.Context) (domain.FeedPage, error) {
-		page, err := reader.source.LoadFeedPage(ctx, category, orderedIDs, limit)
-		if page.Items == nil {
-			page.Items = []domain.FeedReel{}
-		}
-		return page, err
+func (reader *CachedFeedReader) ReadFeedPage(ctx context.Context, category string, orderedIDs []int64, limit int) (domain.FeedPage, error) {
+	// The cached order can outlive a catalog change. The page query checks
+	// publication and category against PostgreSQL for every response.
+	return readPostgres(ctx, reader.cache, "feed_page", func(ctx context.Context) (domain.FeedPage, error) {
+		return reader.source.LoadFeedPage(ctx, category, orderedIDs, limit)
 	})
 }

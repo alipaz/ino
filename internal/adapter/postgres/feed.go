@@ -37,7 +37,8 @@ const feedProductCategories = `product_categories AS (
 
 func (reader *FeedReader) LoadFeedCandidates(ctx context.Context, category string, preferred []string) ([]domain.FeedCandidate, error) {
 	// The discovery proxy keeps candidate selection bounded before computing
-	// shares and watches. The ranking policy applies the V1 weights afterward.
+	// shares and watches. Fill slots lost to overlapping buckets with the next
+	// most recent eligible reels, then apply the V1 ranking policy.
 	const query = `
 		WITH eligible AS MATERIALIZED (
 			SELECT r.id, r.created_at, r.duration_ms, r.like_count, r.save_count, r.view_count
@@ -64,8 +65,17 @@ func (reader *FeedReader) LoadFeedCandidates(ctx context.Context, category strin
 			ORDER BY min(array_position($2::text[], p.category)), eligible.created_at DESC, eligible.id DESC
 			LIMIT 60
 		),
-		selected_reels (reel_id) AS MATERIALIZED (
+		discovered AS MATERIALIZED (
 			SELECT id FROM fresh UNION SELECT id FROM popular UNION SELECT id FROM preferred
+		),
+		backfill AS (
+			SELECT eligible.id FROM eligible
+			WHERE NOT EXISTS (SELECT 1 FROM discovered WHERE discovered.id = eligible.id)
+			ORDER BY eligible.created_at DESC, eligible.id DESC
+			LIMIT ($3::bigint - (SELECT count(*) FROM discovered))
+		),
+		selected_reels (reel_id) AS MATERIALIZED (
+			SELECT id FROM discovered UNION ALL SELECT id FROM backfill
 		),
 		` + feedProductCategories + `,
 		share_counts AS (
@@ -93,7 +103,7 @@ func (reader *FeedReader) LoadFeedCandidates(ctx context.Context, category strin
 		LEFT JOIN watch_counts AS w USING (reel_id)
 		LEFT JOIN product_categories AS p USING (reel_id)`
 
-	rows, err := reader.pool.Query(ctx, query, category, preferred)
+	rows, err := reader.pool.Query(ctx, query, category, preferred, domain.MaxFeedCandidates)
 	if err != nil {
 		return nil, fmt.Errorf("query feed candidates: %w", err)
 	}

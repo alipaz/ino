@@ -108,7 +108,7 @@ func (stub feedHTTPStub) ReadFeedOrder(ctx context.Context, _ int64, _, _ string
 	}
 	return load(ctx)
 }
-func (feedHTTPStub) ReadFeedPage(_ context.Context, _ int64, _, _ string, ids []int64, limit int) (domain.FeedPage, error) {
+func (feedHTTPStub) ReadFeedPage(_ context.Context, _ string, ids []int64, limit int) (domain.FeedPage, error) {
 	items := make([]domain.FeedReel, 0, limit)
 	for _, id := range ids[:min(len(ids), limit)] {
 		items = append(items, domain.FeedReel{

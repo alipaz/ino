@@ -1,6 +1,7 @@
 package postgres_test
 
 import (
+	"context"
 	"encoding/json"
 	"io"
 	"log/slog"
@@ -9,6 +10,7 @@ import (
 	"net/url"
 	"reflect"
 	"testing"
+	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
@@ -18,6 +20,58 @@ import (
 	"ino/internal/transport/httpapi"
 	"ino/internal/usecase"
 )
+
+func TestFeedTraversesSeededPublishedReelsPostgres(t *testing.T) {
+	pool := openCatalogTestPool(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if inserted, err := postgres.SeedAssessment(ctx, pool); err != nil || !inserted {
+		t.Fatalf("seed: inserted=%v, err=%v", inserted, err)
+	}
+	var want int
+	if err := pool.QueryRow(ctx, "SELECT count(*) FROM reels WHERE status = 'published'").Scan(&want); err != nil {
+		t.Fatal(err)
+	}
+
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	readCache := cache.NewReadCache(nil, time.Second, 4, logger)
+	source := postgres.NewFeedReader(pool)
+	cachedFeed := cache.NewCachedFeedReader(readCache, source)
+	signer, err := usecase.NewFeedCursor([]byte("feed-integration-secret-only-0123456789"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	feed := usecase.NewFeed(source, ranking.NewWeightedFeedRanker(ranking.V1Policy()), cachedFeed, cachedFeed, signer)
+	router := httpapi.NewRouter(logger, pool.Ping)
+	httpapi.RegisterFeedRoutes(router, logger, postgres.NewReelWriter(pool), feed)
+
+	for _, viewer := range []struct{ name, header string }{{"guest", ""}, {"personalized", "1"}} {
+		t.Run(viewer.name, func(t *testing.T) {
+			const first = "/api/v1/feed?limit=50"
+			path := first
+			seen := make(map[int64]bool, want)
+			for {
+				page := getFeedResponse(t, router, path, viewer.header)
+				for _, id := range page.reelIDs() {
+					if seen[id] {
+						t.Fatalf("duplicate reel %d", id)
+					}
+					seen[id] = true
+				}
+				if page.NextCursor == nil {
+					break
+				}
+				if len(page.Items) == 0 || len(seen) >= want {
+					t.Fatalf("unexpected continuation at %d results", len(seen))
+				}
+				path = first + "&cursor=" + url.QueryEscape(*page.NextCursor)
+			}
+			if len(seen) != want {
+				t.Fatalf("feed returned %d unique published reels, want %d", len(seen), want)
+			}
+		})
+	}
+}
 
 func TestFeedWarmReadsAndStableCursorPostgresRedis(t *testing.T) {
 	ctx, pool, redisClient, activity := openPostgresRedisTest(t)
@@ -76,7 +130,7 @@ func TestFeedWarmReadsAndStableCursorPostgresRedis(t *testing.T) {
 
 	queryCount.n.Store(0)
 	warm := getFeedResponse(t, router, initial, "1")
-	if !reflect.DeepEqual(warm.reelIDs(), first.reelIDs()) || queryCount.n.Load() != 0 {
+	if !reflect.DeepEqual(warm.reelIDs(), first.reelIDs()) || queryCount.n.Load() != 1 {
 		t.Fatalf("warm feed = %+v, query count = %d", warm, queryCount.n.Load())
 	}
 	const public = "/api/v1/feed?category=outdoors"
@@ -86,7 +140,7 @@ func TestFeedWarmReadsAndStableCursorPostgresRedis(t *testing.T) {
 		t.Fatalf("cold multi-reel public GET = %+v, PostgreSQL queries = %d, want two", publicPage, queryCount.n.Load())
 	}
 	queryCount.n.Store(0)
-	if result := getFeedResponse(t, router, public, ""); !reflect.DeepEqual(result, publicPage) || queryCount.n.Load() != 0 {
+	if result := getFeedResponse(t, router, public, ""); !reflect.DeepEqual(result, publicPage) || queryCount.n.Load() != 1 {
 		t.Fatalf("warm public GET = %+v, PostgreSQL queries = %d", result, queryCount.n.Load())
 	}
 
@@ -109,6 +163,13 @@ func TestFeedWarmReadsAndStableCursorPostgresRedis(t *testing.T) {
 	if _, err := pool.Exec(ctx, mutation); err != nil {
 		t.Fatal(err)
 	}
+	t.Run("archival is visible before projection", func(t *testing.T) {
+		queryCount.n.Store(0)
+		got := getFeedResponse(t, router, public, "").reelIDs()
+		if !reflect.DeepEqual(got, []int64{1, 6, 7}) || queryCount.n.Load() != 1 {
+			t.Fatalf("warm page after archiving reel 5 = %v, PostgreSQL queries = %d", got, queryCount.n.Load())
+		}
+	})
 	drainCacheOutbox(t, ctx, pool, projector.Apply)
 	reranked := getFeedResponse(t, router, initial, "1")
 	if !reflect.DeepEqual(reranked.reelIDs(), []int64{7}) {
@@ -121,8 +182,8 @@ func TestFeedWarmReadsAndStableCursorPostgresRedis(t *testing.T) {
 		t.Fatalf("continuation should skip archived reel 5 and retain reel 6 before reel 7: %+v", next)
 	}
 	queryCount.n.Store(0)
-	if again := getFeedResponse(t, router, nextPath, "1"); !reflect.DeepEqual(again, next) || queryCount.n.Load() != 0 {
-		t.Fatalf("warm continuation changed or read PostgreSQL: %+v, queries=%d", again, queryCount.n.Load())
+	if again := getFeedResponse(t, router, nextPath, "1"); !reflect.DeepEqual(again, next) || queryCount.n.Load() != 1 {
+		t.Fatalf("warm continuation changed or exceeded one page query: %+v, queries=%d", again, queryCount.n.Load())
 	}
 	for _, tc := range []struct {
 		path, user string

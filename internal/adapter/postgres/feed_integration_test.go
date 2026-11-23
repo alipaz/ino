@@ -217,4 +217,21 @@ func TestFeedCandidatePoolsReserveRoomForPreferencesPostgres(t *testing.T) {
 			}
 		})
 	}
+
+	t.Run("overlapping fresh and popular buckets fill to the cap", func(t *testing.T) {
+		if _, err := pool.Exec(ctx, "UPDATE reels SET save_count = 0"); err != nil {
+			t.Fatal(err)
+		}
+		candidates, err := reader.LoadFeedCandidates(ctx, "", nil)
+		if err != nil || len(candidates) != domain.MaxFeedCandidates {
+			t.Fatalf("loaded %d candidates, err=%v", len(candidates), err)
+		}
+		seen := make(map[int64]bool, len(candidates))
+		for _, candidate := range candidates {
+			if candidate.ID <= 100 || candidate.ID > 300 || seen[candidate.ID] {
+				t.Fatalf("unexpected or duplicate candidate %d", candidate.ID)
+			}
+			seen[candidate.ID] = true
+		}
+	})
 }

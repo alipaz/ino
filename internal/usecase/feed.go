@@ -35,7 +35,7 @@ type FeedOrderCache interface {
 }
 
 type FeedPageReader interface {
-	ReadFeedPage(ctx context.Context, viewerID int64, category, rankingVersion string, orderedIDs []int64, limit int) (domain.FeedPage, error)
+	ReadFeedPage(ctx context.Context, category string, orderedIDs []int64, limit int) (domain.FeedPage, error)
 }
 
 type Feed struct {
@@ -79,7 +79,7 @@ func (feed *Feed) Explore(ctx context.Context, request FeedRequest, now time.Tim
 		return FeedResult{Items: []domain.FeedReel{}}, nil
 	}
 
-	page, err := feed.pages.ReadFeedPage(ctx, request.ViewerID, request.Category, domain.FeedRankingVersion, remaining, request.Limit)
+	page, err := feed.pages.ReadFeedPage(ctx, request.Category, remaining, request.Limit)
 	if err != nil {
 		return FeedResult{}, fmt.Errorf("materialize feed page: %w", err)
 	}

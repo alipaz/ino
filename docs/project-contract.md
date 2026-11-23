@@ -167,9 +167,10 @@ A signed cursor freezes the order of up to 200 reels for 10 minutes and is
 bound to its viewer and category. Invalid cursors return 400 and expired
 cursors return 410. Continuation pages keep the original order through
 ranking changes and Redis outages. Details skip reels that no longer qualify.
-Redis holds short-lived identity, order, and page entries. Catalog projection invalidates all affected order and page entries. Activity
-projection invalidates only the actor's first-page orders. Fallback uses the existing shared
-PostgreSQL limits and returns 503 when unavailable or overloaded.
+Redis holds short-lived identity and feed order entries. Catalog projection
+invalidates affected orders. Activity projection invalidates only the actor's
+first-page orders. Nonempty pages are read from PostgreSQL, and they share the
+read budget with cache fallbacks.
 
 This phase uses the existing schema, watch API and persistence.
 
@@ -198,3 +199,19 @@ preserves the recent-activity and interaction-state paths. Other viewers
 and guests may see global engagement changes after the existing 15-second
 order TTL. Viewer and catalog epochs both guard stale fills. Signed
 continuations keep their original order.
+
+## Assessment review follow-up
+
+**Complete (2026-11-23).** Go tests with PostgreSQL and Redis, Go vet,
+Compose configuration, and a race-detector run for read admission passed.
+A fresh Compose run returned 200 unique reels over four pages for both
+guest and personalized feeds. It skipped an archived reel immediately
+while the projector was stopped. With Redis stopped, one 24-request burst
+on the demo data returned 19 successful responses and five controlled 503
+responses. This check used the demo dataset.
+
+Feed discovery now fills slots lost to overlapping candidate buckets with the
+newest eligible reels up to the existing 200-item snapshot limit. PostgreSQL
+materializes pages and checks publication and category before responding.
+The API shares four PostgreSQL read slots between cache fallbacks and feed
+pages. Up to 16 additional reads can wait for up to 100 ms.

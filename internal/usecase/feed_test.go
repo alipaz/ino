@@ -141,7 +141,7 @@ func (fixture *feedFixture) Rank([]domain.FeedCandidate, domain.FeedPreferences,
 func (*feedFixture) ReadFeedOrder(ctx context.Context, _ int64, _, _ string, load func(context.Context) ([]int64, error)) ([]int64, error) {
 	return load(ctx)
 }
-func (fixture *feedFixture) ReadFeedPage(_ context.Context, _ int64, _, _ string, ids []int64, limit int) (domain.FeedPage, error) {
+func (fixture *feedFixture) ReadFeedPage(_ context.Context, _ string, ids []int64, limit int) (domain.FeedPage, error) {
 	fixture.pageLoads++
 	page := domain.FeedPage{}
 	for i, id := range ids {

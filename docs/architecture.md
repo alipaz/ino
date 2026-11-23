@@ -126,11 +126,14 @@ generation, current value, and applicable catalog epoch still match. An
 invalidation, an eviction, or a competing fill can invalidate the claim.
 This guards against an older database read repopulating an invalidated entry.
 
-A single API process coalesces fallback work per key. It admits up to four
-concurrent PostgreSQL reads with a deadline of 750 ms each, and rejects excess
-fallback work with 503. An individual waiting request can cancel independently
-of the shared load. Redis calls use a separate configurable deadline.
-Successful reads and writes tolerate Redis connection and fill failures.
+A single API process coalesces cache fallback work per key. Feed page queries
+and cache fallbacks share four concurrent PostgreSQL read slots. Up to 16
+reads can wait for up to 100 ms before admission. Each admitted query has
+a 750 ms deadline, bounded by the caller's context when the read is unshared.
+Saturated or timed-out admissions return 503. An individual waiting request
+can cancel independently of a coalesced load. Redis calls use a separate
+configurable deadline. Successful reads and writes tolerate Redis connection
+and fill failures.
 
 Migration 00003 uses PostgreSQL hooks to append activity and enqueue cache
 work in the originating transaction. The watch threshold latch records the
@@ -169,19 +172,20 @@ existing authoritative uniqueness and conflict handling. See the
 The feed use case composes batched PostgreSQL queries, the pure V1 ranker,
 and an authenticated cursor. The first read loads activity and watch inputs
 only on a cold personalized order. Discovery selects bounded fresh, popular,
-and category buckets before aggregating global share and watch facts. Page SQL
-uses cursor ordinality and current eligibility to fetch creators and products
-without one call per reel.
+and category buckets, then fills any overlap with the newest remaining
+eligible reels before aggregating global share and watch facts. Page SQL uses
+cursor ordinality and current eligibility to fetch creators and products in a
+single PostgreSQL query. Each nonempty page uses the shared read limiter and
+rechecks visibility even if catalog projection has not run.
 
-The Redis adapter uses the shared read limiter and coalescing for feed order
-and materialized page keys. Both depend on the catalog epoch. Signed-in
-feed orders also depend on a short-lived viewer epoch. Activity deletes that
-viewer's epoch across all categories without scanning keys. Fills compare
-both epochs for those orders. Public orders and other viewers learn about
-global engagement changes as their order TTL expires. The signed
-cursor contains the ordered IDs, viewer, category, position and expiry, so
-continuations need only page data. See the [feed guide](../README.md#explore-feed)
-for the ranking and pagination contracts.
+The Redis adapter coalesces reads for each feed order key. Orders depend on
+the catalog epoch. Signed-in orders also depend on a short-lived viewer epoch.
+Activity deletes that viewer's epoch across all categories without scanning
+keys. Fills compare both epochs for those orders. Public orders and other
+viewers learn about global engagement changes as their order TTL expires.
+The signed cursor contains the ordered IDs, viewer, category, position and
+expiry, so continuations only read page data. See the
+[feed guide](../README.md#explore-feed) for the ranking and pagination contracts.
 
 ## References
 

@@ -21,6 +21,8 @@ const (
 	cachePrefix     = "ino:cache:v1:"
 	catalogEpochKey = cachePrefix + "catalog"
 	fallbackTimeout = 750 * time.Millisecond
+	fallbackWait    = 100 * time.Millisecond
+	waitersPerSlot  = 4
 	scopedEpochTTL  = time.Minute
 	productsTTL     = 15 * time.Second
 	stateTTL        = 10 * time.Second
@@ -33,13 +35,20 @@ type ReadCache struct {
 	client    *goredis.Client
 	timeout   time.Duration
 	fallbacks chan struct{}
+	waiters   chan struct{}
 	loads     singleflight.Group
 	logger    *slog.Logger
 }
 
 // client may be nil for a PostgreSQL-only deployment. The limiter still applies.
 func NewReadCache(client *goredis.Client, timeout time.Duration, maxFallbacks int, logger *slog.Logger) *ReadCache {
-	return &ReadCache{client: client, timeout: timeout, fallbacks: make(chan struct{}, maxFallbacks), logger: logger}
+	return &ReadCache{
+		client:    client,
+		timeout:   timeout,
+		fallbacks: make(chan struct{}, maxFallbacks),
+		waiters:   make(chan struct{}, maxFallbacks*waitersPerSlot),
+		logger:    logger,
+	}
 }
 
 type cacheKey struct {
@@ -166,7 +175,7 @@ func cachedRead[T any](ctx context.Context, cache *ReadCache, key cacheKey, ttl 
 	}
 	result := cache.loads.DoChan(key.name, func() (any, error) {
 		// One disconnected caller must not cancel the shared load. The work has
-		// independent Redis and PostgreSQL deadlines and never waits for a slot.
+		// independent Redis and PostgreSQL deadlines and bounded admission.
 		workCtx := context.WithoutCancel(ctx)
 		var read cacheRead
 		if cache.client != nil {
@@ -200,15 +209,18 @@ func cachedRead[T any](ctx context.Context, cache *ReadCache, key cacheKey, ttl 
 }
 
 func readPostgres[T any](ctx context.Context, cache *ReadCache, kind string, load func(context.Context) (T, error)) (T, error) {
-	select {
-	case cache.fallbacks <- struct{}{}:
-		defer func() { <-cache.fallbacks }()
-	default:
-		cache.logger.Debug("cache fallback", "kind", kind, "outcome", "overloaded")
+	if err := cache.acquireReadSlot(ctx); err != nil {
+		if errors.Is(err, context.DeadlineExceeded) {
+			err = fmt.Errorf("%w: %w", usecase.ErrReadUnavailable, err)
+		}
+		if errors.Is(err, usecase.ErrReadUnavailable) {
+			cache.logger.Debug("postgres read", "kind", kind, "outcome", "overloaded")
+		}
 		var zero T
-		return zero, usecase.ErrReadUnavailable
+		return zero, err
 	}
-	cache.logger.Debug("cache fallback", "kind", kind, "outcome", "postgres")
+	defer func() { <-cache.fallbacks }()
+	cache.logger.Debug("postgres read", "kind", kind, "outcome", "started")
 	ctx, cancel := context.WithTimeout(ctx, fallbackTimeout)
 	defer cancel()
 	value, err := load(ctx)
@@ -221,6 +233,42 @@ func readPostgres[T any](ctx context.Context, cache *ReadCache, kind string, loa
 		}
 	}
 	return value, err
+}
+
+// Admit short bursts without allowing unbounded waiters or consuming the
+// query deadline while a read waits for a slot.
+func (cache *ReadCache) acquireReadSlot(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	select {
+	case cache.fallbacks <- struct{}{}:
+		return nil
+	default:
+	}
+	select {
+	case cache.waiters <- struct{}{}:
+		defer func() { <-cache.waiters }()
+	default:
+		return usecase.ErrReadUnavailable
+	}
+
+	wait, cancel := context.WithTimeout(ctx, fallbackWait)
+	defer cancel()
+	deadline, _ := wait.Deadline()
+	select {
+	case cache.fallbacks <- struct{}{}:
+		// Admission and cancellation can become ready together.
+		if wait.Err() == nil && time.Now().Before(deadline) {
+			return nil
+		}
+		<-cache.fallbacks
+	case <-wait.Done():
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	return usecase.ErrReadUnavailable
 }
 
 func unavailableSQLState(code string) bool {

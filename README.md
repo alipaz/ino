@@ -152,7 +152,8 @@ for popular discovery, and up to five strongest positive categories. V1
 weights apply after discovery. Public discovery reserves
 100 fresh and 100 popular positions. Personalized discovery with preferred
 categories reserves 70 fresh, 70 popular, and 60 category positions.
-Buckets can overlap, so the deduplicated set may contain fewer than 200.
+When buckets overlap, the newest remaining eligible reels fill those slots
+up to the 200-reel limit. Ranking runs after this selection.
 
 Global shares are deduplicated by sender and reel. The ranking input uses
 the maximum stored watch time per user and reel. A watch below 20% is a
@@ -178,21 +179,22 @@ ID descending.
 
 ### Feed cache behavior
 
-Identity, first-page ordering, and materialized pages use Redis first. A
-complete warm request makes zero PostgreSQL queries. Ordering lasts up to
-15 seconds, and page content lasts up to 10 seconds. Committed catalog events
-invalidate both. An activity event refreshes only that viewer's first-page
-order across categories. Guests and other viewers can reflect global
-engagement changes when their orders expire. Counted views still appear in
-recent activity even though they have zero ranking weight. Watch reports
-without an outbox event affect a new browse when its cached order expires. Cached pages may briefly lag publication
-or category edits until invalidation arrives or their TTL expires. Page fields
-such as counters and creator names can lag until the page TTL expires.
+Identity and first-page ordering use Redis first. A cached order lasts up to
+15 seconds. Each nonempty order is materialized in one PostgreSQL query that
+reads current publication, category eligibility, counters, creator, and
+products. Archived reels are skipped even while the projector is behind.
+Newly eligible reels can join a fresh browse when the cached order is refreshed.
+
+Committed catalog events invalidate orders. Activity refreshes only that
+viewer's first-page orders across categories. Guests and other viewers can
+reflect global engagement changes when their orders expire. Watch reports
+without an outbox event affect a new browse when its cached order expires.
 
 Redis misses and failures fall back to bounded, coalesced PostgreSQL reads.
-If a fallback cannot be admitted or PostgreSQL is unavailable, the request
-returns 503. Redis is optional at startup. [Redis behavior and freshness](#redis-behavior-and-freshness)
-describes the shared fallback limits and verification setup.
+This work shares its read budget with feed page queries. The API returns 503
+if PostgreSQL is unavailable or a read cannot be admitted within its limit.
+Redis is optional at startup. See [Redis behavior and freshness](#redis-behavior-and-freshness)
+for admission limits and verification setup.
 
 ## List products for a published reel
 
@@ -292,9 +294,9 @@ stay the same.
 
 `docker compose up --build` starts two independent processes after migration.
 Only `api` serves HTTP. Its PostgreSQL pool is capped at 10 connections, with
-up to four concurrent cache fallbacks, and its Redis client is capped at 12
-connections. The `read-projector` service uses its
-own PostgreSQL pool capped at two connections: one for the outbox transaction
+up to four concurrent PostgreSQL reads shared between cache fallbacks and feed
+pages. Its Redis client is capped at 12 connections. The `read-projector`
+service has its own pool with two PostgreSQL connections, one for the outbox transaction
 and one for a snapshot read. It also uses a separate Redis client capped at
 two connections. Outbox batches have a five-second deadline, and PostgreSQL
 snapshot reads have a 750 ms deadline. Both processes use
@@ -317,12 +319,14 @@ while the projector is stopped.
 | Mock identity existence | 15 seconds |
 | Immutable share receipt | 5 minutes |
 
-A warm GET reads Redis only, including its identity and reel visibility
-checks. Valid empty results and false flags are cache hits. Missing,
-incomplete, or unavailable entries fall back to PostgreSQL. Each API process
-coalesces simultaneous loads of the same key and admits up to four concurrent
-PostgreSQL fallbacks across keys. There is no waiting queue for those slots.
-The PostgreSQL read deadline is 750 ms. Cache population is best effort.
+Warm product, interaction-state, and recent-activity GETs read Redis, including
+cached identity and reel visibility checks. Valid empty results and false
+flags are cache hits. Missing, incomplete, or unavailable entries fall back
+to PostgreSQL. Each API process coalesces simultaneous cache loads of the same
+key. Cache misses and feed page queries share four concurrent read slots and
+up to 16 waiting slots. A queued read can wait up to 100 ms, followed by up to
+750 ms for the PostgreSQL read. A full waiting queue returns 503 immediately.
+Cache population is best effort.
 
 PostgreSQL commits writes and activity together. Redis reads can lag while the
 projector delivers committed invalidations. For example, a previously cached
@@ -393,11 +397,11 @@ To check Redis fallback manually in that disposable stack, warm the three GETs
 above against the chosen API port after loading test fixtures. Repeat them
 and look for `cache read` logs with outcome `hit`. Run
 `docker compose stop redis`, repeat the same GETs, and check that the bodies
-match and the logs show `cache fallback`. Run `docker compose start redis` to
+match and the logs show `postgres read`. Run `docker compose start redis` to
 allow cache fills and queued invalidations to resume. Perform this check
 before bringing the disposable stack down. The integration suite below
-counts pgx queries during cold and warm HTTP requests to verify the zero-query
-GET contract.
+counts pgx queries for Redis-only product, interaction-state, and activity reads
+and verifies one PostgreSQL statement for a nonempty feed with a cached order.
 
 ## PostgreSQL integration tests
 
