@@ -169,9 +169,12 @@ func TestFeedCandidatePoolsReserveRoomForPreferencesPostgres(t *testing.T) {
 			CASE WHEN id BETWEEN 101 AND 200 THEN 1 ELSE 0 END
 		FROM generate_series(1, 300) id;
 		INSERT INTO products (id, title, brand, image_url, price, category)
-			VALUES (1, 'Candle', 'INO', 'image', 800, 'favorite');
+			VALUES (1, 'Candle', 'INO', 'image', 800, 'favorite'),
+				(2, 'Mug', 'INO', 'image', 800, 'browse');
 		INSERT INTO reel_products (reel_id, product_id, display_position)
-			SELECT id, 1, 0 FROM generate_series(1, 100) id;`
+			SELECT id, 1, 0 FROM generate_series(1, 100) id
+			UNION ALL
+			SELECT id, 2, 1 FROM generate_series(1, 300) id;`
 	if _, err := pool.Exec(ctx, fixtures); err != nil {
 		t.Fatal(err)
 	}
@@ -179,6 +182,7 @@ func TestFeedCandidatePoolsReserveRoomForPreferencesPostgres(t *testing.T) {
 
 	for _, tc := range []struct {
 		name      string
+		category  string
 		preferred []string
 		wantFresh int
 		wantLiked int
@@ -186,9 +190,10 @@ func TestFeedCandidatePoolsReserveRoomForPreferencesPostgres(t *testing.T) {
 	}{
 		{name: "public", wantFresh: 100, wantLiked: 100},
 		{name: "personalized", preferred: []string{"favorite"}, wantFresh: 70, wantLiked: 70, wantOlder: 60},
+		{name: "personalized with category", category: "browse", preferred: []string{"favorite"}, wantFresh: 70, wantLiked: 70, wantOlder: 60},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			candidates, err := reader.LoadFeedCandidates(ctx, "", tc.preferred)
+			candidates, err := reader.LoadFeedCandidates(ctx, tc.category, tc.preferred)
 			if err != nil {
 				t.Fatal(err)
 			}

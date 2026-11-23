@@ -5,7 +5,7 @@ RUN go mod download
 COPY cmd ./cmd
 COPY internal ./internal
 COPY migrations ./migrations
-RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/ ./cmd/api ./cmd/migrate ./cmd/seed ./cmd/read-projector
+RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/ ./cmd/api ./cmd/migrate ./cmd/seed ./cmd/cache-sync-worker
 
 FROM alpine:3.22.2 AS runtime
 RUN addgroup -S -g 10001 ino && adduser -S -D -H -u 10001 -G ino ino
@@ -20,9 +20,9 @@ FROM runtime AS seed
 COPY --from=build /out/seed /usr/local/bin/seed
 ENTRYPOINT ["/usr/local/bin/seed"]
 
-FROM runtime AS read-projector
-COPY --from=build /out/read-projector /usr/local/bin/read-projector
-ENTRYPOINT ["/usr/local/bin/read-projector"]
+FROM runtime AS cache-sync-worker
+COPY --from=build /out/cache-sync-worker /usr/local/bin/cache-sync-worker
+ENTRYPOINT ["/usr/local/bin/cache-sync-worker"]
 
 FROM runtime AS api
 COPY --from=build /out/api /usr/local/bin/api

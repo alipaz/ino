@@ -19,11 +19,13 @@ func NewFeedReader(pool *pgxpool.Pool) *FeedReader {
 }
 
 // The category qualifies the reel without restricting the products returned.
-const feedCategoryFilter = `($1::text = '' OR EXISTS (
+const feedCategoryMembership = `EXISTS (
 	SELECT 1 FROM reel_products AS association
 	JOIN products AS product ON product.id = association.product_id
 	WHERE association.reel_id = r.id AND product.category = $1
-))`
+)`
+
+const feedCategoryFilter = `($1::text = '' OR ` + feedCategoryMembership + `)`
 
 // Aggregate distinct categories exactly once per reel, even when several
 // selected signals or attached products refer to the same category.
@@ -35,15 +37,53 @@ const feedProductCategories = `product_categories AS (
 	GROUP BY association.reel_id
 )`
 
+// A reel outside a category's first 60 already has enough reels ahead of it
+// in the preferred ordering to miss the 60-item bucket.
+const feedUnfilteredPreferences = `
+	SELECT recent.id
+	FROM unnest($2::text[]) WITH ORDINALITY AS preference(category, position)
+	CROSS JOIN LATERAL (
+		SELECT e.id, e.created_at
+		FROM eligible AS e
+		WHERE EXISTS (
+			SELECT 1 FROM reel_products AS association
+			JOIN products AS product ON product.id = association.product_id
+			WHERE association.reel_id = e.id AND product.category = preference.category
+		)
+		ORDER BY e.created_at DESC, e.id DESC
+		LIMIT 60
+	) AS recent
+	GROUP BY recent.id, recent.created_at
+	ORDER BY min(preference.position), recent.created_at DESC, recent.id DESC
+	LIMIT 60`
+
+// With a category filter, the two category sets can be disjoint. Join them
+// directly so a per-category recency scan does not exhaust the catalog.
+const feedFilteredPreferences = `
+	SELECT e.id
+	FROM eligible AS e
+	JOIN reel_products AS association ON association.reel_id = e.id
+	JOIN products AS product ON product.id = association.product_id
+	WHERE product.category = ANY($2::text[])
+	GROUP BY e.id, e.created_at
+	ORDER BY min(array_position($2::text[], product.category)), e.created_at DESC, e.id DESC
+	LIMIT 60`
+
 func (reader *FeedReader) LoadFeedCandidates(ctx context.Context, category string, preferred []string) ([]domain.FeedCandidate, error) {
-	// The discovery proxy keeps candidate selection bounded before computing
-	// shares and watches. Fill slots lost to overlapping buckets with the next
-	// most recent eligible reels, then apply the V1 ranking policy.
-	const query = `
-		WITH eligible AS MATERIALIZED (
-			SELECT r.id, r.created_at, r.duration_ms, r.like_count, r.save_count, r.view_count
+	// Keep the unfiltered statement free of a correlated category lookup.
+	categoryFilter := `$1::text = ''`
+	preferredQuery := feedUnfilteredPreferences
+	if category != "" {
+		categoryFilter = feedCategoryMembership
+		preferredQuery = feedFilteredPreferences
+	}
+	// Leave eligibility inlined so each discovery bucket can stop at its
+	// indexed limit. Only the selected IDs and their facts are materialized.
+	query := `
+		WITH eligible AS NOT MATERIALIZED (
+			SELECT r.id, r.created_at, r.like_count, r.save_count
 			FROM reels AS r
-			WHERE r.status = 'published' AND ` + feedCategoryFilter + `
+			WHERE r.status = 'published' AND ` + categoryFilter + `
 		),
 		fresh AS (
 			SELECT id FROM eligible
@@ -55,27 +95,27 @@ func (reader *FeedReader) LoadFeedCandidates(ctx context.Context, category strin
 			ORDER BY (like_count::numeric + save_count) DESC, created_at DESC, id DESC
 			LIMIT CASE WHEN cardinality($2::text[]) > 0 THEN 70 ELSE 100 END
 		),
-		preferred AS (
-			SELECT eligible.id
-			FROM eligible
-			JOIN reel_products AS rp ON rp.reel_id = eligible.id
-			JOIN products AS p ON p.id = rp.product_id
-			WHERE p.category = ANY($2::text[])
-			GROUP BY eligible.id, eligible.created_at
-			ORDER BY min(array_position($2::text[], p.category)), eligible.created_at DESC, eligible.id DESC
-			LIMIT 60
-		),
+		preferred AS (` + preferredQuery + `),
 		discovered AS MATERIALIZED (
 			SELECT id FROM fresh UNION SELECT id FROM popular UNION SELECT id FROM preferred
 		),
 		backfill AS (
-			SELECT eligible.id FROM eligible
-			WHERE NOT EXISTS (SELECT 1 FROM discovered WHERE discovered.id = eligible.id)
-			ORDER BY eligible.created_at DESC, eligible.id DESC
+			-- The first 200 eligible IDs contain enough unseen IDs to fill
+			-- every open slot, even when all discovered IDs appear there.
+			SELECT recent.id FROM (
+				SELECT id, created_at FROM eligible
+				ORDER BY created_at DESC, id DESC LIMIT $3
+			) AS recent
+			WHERE NOT EXISTS (SELECT 1 FROM discovered WHERE discovered.id = recent.id)
+			ORDER BY recent.created_at DESC, recent.id DESC
 			LIMIT ($3::bigint - (SELECT count(*) FROM discovered))
 		),
 		selected_reels (reel_id) AS MATERIALIZED (
 			SELECT id FROM discovered UNION ALL SELECT id FROM backfill
+		),
+		candidate_details AS MATERIALIZED (
+			SELECT r.id AS reel_id, r.created_at, r.duration_ms, r.like_count, r.save_count, r.view_count
+			FROM selected_reels AS candidate JOIN reels AS r ON r.id = candidate.reel_id
 		),
 		` + feedProductCategories + `,
 		share_counts AS (
@@ -92,13 +132,12 @@ func (reader *FeedReader) LoadFeedCandidates(ctx context.Context, category strin
 			SELECT reel_id,
 				count(*) FILTER (WHERE watched_ms::numeric * 10 >= duration_ms::numeric * 7) AS quality,
 				count(*) FILTER (WHERE watched_ms::numeric * 10 < duration_ms::numeric * 2) AS skips
-			FROM best_watches JOIN eligible ON eligible.id = best_watches.reel_id
+			FROM best_watches JOIN candidate_details USING (reel_id)
 			GROUP BY reel_id
 		)
-		SELECT r.id, r.created_at, r.like_count, r.save_count, COALESCE(s.shares, 0), r.view_count,
+		SELECT r.reel_id, r.created_at, r.like_count, r.save_count, COALESCE(s.shares, 0), r.view_count,
 			COALESCE(w.quality, 0), COALESCE(w.skips, 0), COALESCE(p.categories, ARRAY[]::text[])
-		FROM selected_reels AS candidate
-		JOIN eligible AS r ON r.id = candidate.reel_id
+		FROM candidate_details AS r
 		LEFT JOIN share_counts AS s USING (reel_id)
 		LEFT JOIN watch_counts AS w USING (reel_id)
 		LEFT JOIN product_categories AS p USING (reel_id)`

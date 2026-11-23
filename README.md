@@ -16,11 +16,14 @@ docker compose up
 ```
 
 Use `docker compose up --build` after changing Go code or SQL migrations.
+When upgrading an existing stack across the worker rename, run
+`docker compose up --build --remove-orphans` once to remove the old service
+container.
 The API listens at `http://127.0.0.1:8080`. PostgreSQL and Redis are reachable
 as `postgres:5432` and `redis:6379` inside the Compose network; neither publishes
 a host port. Once PostgreSQL is healthy, the one-shot `migrate` service applies
 pending Goose migrations. The one-shot `seed` service then populates a fresh
-database. The API and read projector start after seed succeeds or skips an
+database. The API and cache sync worker start after seed succeeds or skips an
 existing database. Redis is optional for API startup and requests.
 
 ## Configuration
@@ -44,7 +47,7 @@ docker compose up --build
 | `REDIS_URL` | Compose `redis://redis:6379/0` | Redis endpoint. For a host run, leave it empty to use PostgreSQL only. |
 | `CACHE_REDIS_TIMEOUT` | `50ms` | Deadline per Redis operation |
 | `FEED_CURSOR_SECRET` | Random per process | Signing key of at least 32 bytes. Set the same secret across API instances and restarts to preserve cursors. |
-| `LOG_LEVEL` | `info` | `debug` includes cache hit, miss, fallback, and projector lag logs |
+| `LOG_LEVEL` | `info` | `debug` includes cache hit, miss, fallback, and cache sync worker lag logs |
 
 When changing `POSTGRES_*`, update `DATABASE_URL` to match and URI-encode reserved
 characters in credentials. PostgreSQL initialization variables apply only to a
@@ -182,7 +185,7 @@ ID descending.
 Identity and first-page ordering use Redis first. A cached order lasts up to
 15 seconds. Each nonempty order is materialized in one PostgreSQL query that
 reads current publication, category eligibility, counters, creator, and
-products. Archived reels are skipped even while the projector is behind.
+products. Archived reels are skipped even while the worker is behind.
 Newly eligible reels can join a fresh browse when the cached order is refreshed.
 
 Committed catalog events invalidate orders. Activity refreshes only that
@@ -290,24 +293,24 @@ first crossing of 70% in a playback session. A session that already reached
 creating a historical event. The watch API and duplicate-report behavior
 stay the same.
 
-## API and read projector
+## API and cache sync worker
 
 `docker compose up --build` starts two independent processes after migration.
 Only `api` serves HTTP. Its PostgreSQL pool is capped at 10 connections, with
 up to four concurrent PostgreSQL reads shared between cache fallbacks and feed
-pages. Its Redis client is capped at 12 connections. The `read-projector`
-service has its own pool with two PostgreSQL connections, one for the outbox transaction
-and one for a snapshot read. It also uses a separate Redis client capped at
+pages. Its Redis client is capped at 12 connections. The `cache-sync-worker`
+service has its own pool with two PostgreSQL connections, one for the outbox
+transaction and one for a snapshot read. It also uses a separate Redis client capped at
 two connections. Outbox batches have a five-second deadline, and PostgreSQL
 snapshot reads have a 750 ms deadline. Both processes use
 `CACHE_REDIS_TIMEOUT` for Redis calls.
 
-With `DATABASE_URL` and `REDIS_URL` set, run the projector locally with
-`go run ./cmd/read-projector`. SIGINT or SIGTERM cancels polling and any active
+With `DATABASE_URL` and `REDIS_URL` set, run the worker locally with
+`go run ./cmd/cache-sync-worker`. SIGINT or SIGTERM cancels polling and any active
 batch. Unacknowledged rows stay in PostgreSQL. Stop or start the Compose
-projector independently with `docker compose stop read-projector` and
-`docker compose start read-projector`. The API can keep serving and writing
-while the projector is stopped.
+worker independently with `docker compose stop cache-sync-worker` and
+`docker compose start cache-sync-worker`. The API can keep serving and writing
+while the worker is stopped.
 
 ## Redis behavior and freshness
 
@@ -329,10 +332,10 @@ up to 16 waiting slots. A queued read can wait up to 100 ms, followed by up to
 Cache population is best effort.
 
 PostgreSQL commits writes and activity together. Redis reads can lag while the
-projector delivers committed invalidations. For example, a previously cached
-published reel can briefly return its products after archival until the
+cache sync worker delivers committed invalidations. For example, a previously
+cached published reel can briefly return its products after archival until the
 catalog invalidation reaches Redis or the entry expires. Expiration is
-measured from the fill and reads do not extend it. The projector polls every
+measured from the fill and reads do not extend it. The worker polls every
 250 ms when idle and retries after one second if Redis fails or the guarded
 snapshot write cannot prove it is current. A complete, byte-identical
 foreground fill in the same generation is acknowledged without refreshing
@@ -422,6 +425,108 @@ INO_TEST_DATABASE_URL='postgres://postgres:ino_test@127.0.0.1:15432/postgres?ssl
 INO_TEST_REDIS_URL='redis://127.0.0.1:16379/0' \
   go test -count=1 -p 1 -v ./internal/adapter/postgres ./internal/adapter/redis -run 'Postgres(Redis)?$|Redis$'
 docker stop ino-postgres-test ino-redis-test
+```
+
+## Feed benchmark
+
+Use a fresh, disposable Compose project and a free API port for each version
+and dataset size. The benchmark SQL loads synthetic reels, products, like and
+save rows, shares, and watch sessions after migrations. It requires an empty
+application database. Sizes of 10,000 and 100,000 reels make it easier to see
+the effect of catalog growth. The normal assessment seed still runs on regular
+Compose startup.
+
+From the version you want to measure, point `benchmark_dir` at the directory
+holding these two scripts. Use the same scripts and workload for both versions.
+
+```sh
+benchmark_dir="$PWD/scripts"  # use an absolute path when measuring an older checkout
+benchmark_reels=10000
+export COMPOSE_PROJECT_NAME="ino-feed-bench-$(date +%s)"
+export API_PORT=18080
+bench_compose() {
+  DATABASE_URL='postgres://ino:ino_local@postgres:5432/ino?sslmode=disable' \
+  POSTGRES_USER=ino POSTGRES_PASSWORD=ino_local POSTGRES_DB=ino \
+  REDIS_URL='redis://redis:6379/0' \
+    docker compose --env-file /dev/null -p "$COMPOSE_PROJECT_NAME" "$@"
+}
+
+bench_compose up -d --wait postgres redis
+bench_compose run --build --rm --no-deps migrate up
+bench_compose exec -T postgres psql -X -U ino -d ino -v reels="$benchmark_reels" \
+  < "$benchmark_dir/feed_benchmark.sql"
+bench_compose up --build -d --no-deps api
+curl --fail --retry 8 --retry-all-errors --retry-delay 1 "http://127.0.0.1:$API_PORT/readyz"
+
+for benchmark_mode in warm cold; do
+  python3 "$benchmark_dir/feed_benchmark.py" --base-url "http://127.0.0.1:$API_PORT" --mode "$benchmark_mode"
+done
+bench_compose stop redis
+python3 "$benchmark_dir/feed_benchmark.py" --base-url "http://127.0.0.1:$API_PORT" --mode redis-off
+
+bench_compose down --volumes
+unset COMPOSE_PROJECT_NAME API_PORT
+```
+
+The client uses eight concurrent workers by default and reports successful
+requests per second, p95 among successful responses, and the percentage of
+controlled 503s. The workload alternates between filtered and unfiltered
+authenticated feeds. Warm mode primes a small set of viewers. Cold mode uses
+a new viewer for every request and should run once on a fresh stack. The
+cache sync worker is omitted from these commands to keep cache invalidation traffic
+out of the read-focused workload.
+
+### Before and after
+
+One local run compared commit `406827b` with the indexed query using Go
+1.25.4 on macOS arm64. The API ran on the host with disposable PostgreSQL
+18.6 and Redis 8.10.2 containers. Each row uses 64 requests with eight
+concurrent workers. Each p95
+includes successful requests only, so read it alongside throughput and 503s.
+
+| Reels | Cache | p95 (ms) | Successful responses/s | HTTP 503 |
+| ---: | --- | ---: | ---: | ---: |
+| 10,000 | Warm | 7.1 → 6.4 | 1,472.3 → 1,648.2 | 0.0% → 0.0% |
+| 10,000 | Cold | 94.3 → 40.6 | 118.5 → 279.0 | 0.0% → 0.0% |
+| 10,000 | Redis off | 202.4 → 182.6 | 58.1 → 74.6 | 0.0% → 0.0% |
+| 100,000 | Warm | 13.8 → 12.0 | 1,220.5 → 1,339.4 | 0.0% → 0.0% |
+| 100,000 | Cold | 677.6 → 80.9 | 8.8 → 138.9 | 73.4% → 0.0% |
+| 100,000 | Redis off | 815.2 → 190.1 | 7.7 → 58.2 | 64.1% → 0.0% |
+
+On 100,000 reels, `EXPLAIN (ANALYZE, BUFFERS)` for unfiltered public discovery
+went from 61.4 ms to 6.5 ms. The previous plan materialized 90,000 eligible
+reels. The indexed plan read 100 rows each from the freshness and popularity
+indexes and 200 from the freshness index for backfill. Temporarily dropping
+the popularity index raised the same query to 39.4 ms. The index therefore
+improves cold reads while adding maintenance to Like and Save counter updates.
+A separate 3,000-row update probe used about 29,100 shared-buffer accesses
+before and 49,900 after. That probe measures SQL work on a batch, with no
+application write traffic.
+
+Personalized discovery with a category filter still took about 110 ms in
+one SQL probe. The synthetic fixture has six common categories. A rare
+preferred category can cause a longer recency scan, and this benchmark does
+not estimate capacity on production data.
+
+To inspect plans on the disposable project, enable PostgreSQL plan logging
+before cleanup and outside timed runs. Restart the API to open new sessions.
+A feed request with a cold order logs the candidate query's plan. Use an
+uncached viewer such as user 200 on the default
+benchmark workload.
+
+```sh
+bench_compose exec -T postgres psql -X -U ino -d ino -v ON_ERROR_STOP=1 <<'SQL'
+ALTER DATABASE ino SET session_preload_libraries = 'auto_explain';
+ALTER DATABASE ino SET auto_explain.log_min_duration = 0;
+ALTER DATABASE ino SET auto_explain.log_analyze = on;
+ALTER DATABASE ino SET auto_explain.log_buffers = on;
+ALTER DATABASE ino SET auto_explain.log_timing = off;
+SQL
+bench_compose start redis
+bench_compose restart api
+curl --fail --retry 8 --retry-all-errors --retry-delay 1 -H 'X-User-ID: 200' \
+  "http://127.0.0.1:$API_PORT/api/v1/feed"
+bench_compose logs --tail 300 postgres
 ```
 
 ## Shutdown

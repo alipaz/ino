@@ -111,7 +111,7 @@ this phase.
 **Complete (2026-11-22).** Go tests, vet, Compose config, and the explicit
 PostgreSQL and Redis integration suites passed. The isolated Compose smoke
 test applied migration 00003, restarted the API with Redis stopped, and
-verified fallback, durable writes, and projector recovery after Redis resumed.
+verified fallback, durable writes, and worker recovery after Redis resumed.
 
 The public products response keeps the same shape and order.
 `GET /api/v1/reels/{id}/interaction-state` returns the caller's `liked` and
@@ -181,8 +181,8 @@ disposable PostgreSQL and Redis integration suites passed. Isolated Compose
 startup verified the seeded demo and a same-volume relaunch skipped seeding.
 The cache regression verified unrelated hits and rejection of stale fills.
 
-Compose starts `seed` after Goose migrations complete. The API and projector
-wait for seed success, including a successful skip when any application
+Compose starts `seed` after Goose migrations complete. The API and cache sync
+worker wait for seed success, including a successful skip when any application
 data already exists. A transaction and advisory lock protect the fresh
 install. It verifies required dataset sizes and matches reel counters to
 the actual like, save, and counted-view rows before committing.
@@ -206,7 +206,7 @@ continuations keep their original order.
 Compose configuration, and a race-detector run for read admission passed.
 A fresh Compose run returned 200 unique reels over four pages for both
 guest and personalized feeds. It skipped an archived reel immediately
-while the projector was stopped. With Redis stopped, one 24-request burst
+while the worker was stopped. With Redis stopped, one 24-request burst
 on the demo data returned 19 successful responses and five controlled 503
 responses. This check used the demo dataset.
 
@@ -215,3 +215,29 @@ newest eligible reels up to the existing 200-item snapshot limit. PostgreSQL
 materializes pages and checks publication and category before responding.
 The API shares four PostgreSQL read slots between cache fallbacks and feed
 pages. Up to 16 additional reads can wait for up to 100 ms.
+
+## Feed discovery performance
+
+**Complete (2026-11-23).** The suite passed with disposable PostgreSQL and Redis.
+Go vet, Compose configuration, fresh Compose startup, and the benchmark fixture
+guard also passed. Migration 00004 adds partial recency and popularity indexes.
+The discovery query materializes only bounded candidate sets and verifies
+category eligibility before ranking.
+
+Candidate IDs and ranking facts matched the baseline for filtered and
+unfiltered public and personalized lookups on both benchmark sizes.
+In the 100,000-reel test, cold-feed p95 went from 677.6 ms to 80.9 ms and
+controlled 503s went from 73.4% to zero. See the
+[benchmark](../README.md#feed-benchmark) for warm and outage results,
+reproduction steps, and the popularity index's write tradeoff.
+
+## Cache sync worker rename
+
+**Complete (2026-11-23).** The Go command and Compose service now use
+`cache-sync-worker`. Go tests, Go vet, and Compose service validation passed,
+as did the full test suite with disposable PostgreSQL and Redis.
+
+An isolated Compose build started the worker with
+`/usr/local/bin/cache-sync-worker` as its entrypoint. With the worker stopped,
+a valid Like returned HTTP 204 and left two pending outbox rows. Starting
+the worker cleared both rows and projected the `like_added` event to Redis.

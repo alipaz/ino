@@ -1,4 +1,4 @@
-// Command read-projector projects committed PostgreSQL outbox work into Redis.
+// Command cache-sync-worker projects committed PostgreSQL outbox work into Redis.
 package main
 
 import (
@@ -29,7 +29,7 @@ func start() int {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	if err := run(ctx, cfg, logger); err != nil {
-		logger.Error("read projector failed", "error", err)
+		logger.Error("cache sync worker failed", "error", err)
 		return 1
 	}
 	return 0
@@ -46,7 +46,7 @@ func run(ctx context.Context, cfg config.Config, logger *slog.Logger) error {
 		return err
 	}
 	if redisClient == nil {
-		logger.Info("read projector disabled because REDIS_URL is empty")
+		logger.Info("cache sync worker disabled because REDIS_URL is empty")
 		<-ctx.Done()
 		return nil
 	}
@@ -67,8 +67,8 @@ func run(ctx context.Context, cfg config.Config, logger *slog.Logger) error {
 	readCache := cacheadapter.NewReadCache(redisClient, cfg.CacheRedisTimeout, projectorSnapshotReads, logger)
 	outbox := postgres.NewCacheOutbox(pool)
 	projector := cacheadapter.NewRecentInteractionProjector(readCache, postgres.NewInteractionReader(pool))
-	logger.Info("read projector started")
+	logger.Info("cache sync worker started")
 	projector.Run(ctx, outbox.ProcessBatch)
-	logger.Info("read projector stopped")
+	logger.Info("cache sync worker stopped")
 	return nil
 }

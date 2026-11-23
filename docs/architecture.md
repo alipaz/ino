@@ -8,7 +8,7 @@ PostgreSQL catalog and write paths. The feed runs inside the API process.
 | Location | Responsibility | Status |
 | --- | --- | --- |
 | `cmd/migrate/` | Goose migration and status commands with PostgreSQL session locking | Implemented |
-| `cmd/read-projector/` | Runs the outbox projector with process-local PostgreSQL and Redis connections | Implemented |
+| `cmd/cache-sync-worker/` | Runs the outbox projector with process-local PostgreSQL and Redis connections | Implemented |
 | `cmd/api/` | Executable composition, logging, signals, HTTP lifecycle | Implemented |
 | `internal/config/` | Environment defaults and validation | Implemented |
 | `internal/transport/httpapi/` | Gin router, health and reel responses, activity reads, request/panic logging | Implemented |
@@ -44,7 +44,7 @@ use-case interfaces expose domain results without referring to Redis or pgx.
    same database URL as `api`. Goose applies pending SQL migrations and tracks
    versions. The `seed` command runs next, using the same database URL.
    It serializes with other seed runs and commits only a validated dataset
-   on an empty schema. Both `api` and `read-projector` wait for seed success
+   on an empty schema. Both `api` and `cache-sync-worker` wait for seed success
    and healthy PostgreSQL. Redis is optional for API startup.
 3. The executable validates environment configuration and initializes JSON
    `slog` logging. It installs SIGINT/SIGTERM cancellation before database startup.
@@ -142,12 +142,12 @@ at or above the threshold are marked without backfilling events. Catalog and
 identity changes enqueue their own invalidations. Event IDs and event times
 remain durable in PostgreSQL independently of cache delivery.
 
-The separate `read-projector` process polls every 250 ms when idle. Its pool
+The separate `cache-sync-worker` process polls every 250 ms when idle. Its pool
 has two PostgreSQL connections, one for the outbox transaction and one for a
 snapshot read. Its Redis client is capped at two connections. The API has
 its own PostgreSQL pool capped at ten connections, a Redis cap of twelve
 connections, and a separate four-slot fallback limiter. Signals cancel the
-projector's active batch before closing its clients. A batch claims at most 16
+worker's active batch before closing its clients. A batch claims at most 16
 outbox rows with `FOR UPDATE SKIP LOCKED` inside a five-second transaction.
 Redis success allows acknowledgement by deleting the processed outbox rows.
 Failures roll back the acknowledgement and retry after one second. Delayed
@@ -155,7 +155,7 @@ and repeated jobs invalidate state rather than applying an old field value.
 For recent activity they load the latest 100 durable rows ordered by event time
 and ID descending. A compare-and-set writes the whole complete Redis snapshot
 and applies the TTL atomically. If another request already installed exactly
-the same complete snapshot in the same generation, the projector acknowledges
+the same complete snapshot in the same generation, the worker acknowledges
 the batch without rewriting the value or extending the TTL. A changed
 generation or a competing fill with a different value still triggers a retry.
 Activity committed during a rebuild has its own outbox notification. Eviction
@@ -171,11 +171,13 @@ existing authoritative uniqueness and conflict handling. See the
 
 The feed use case composes batched PostgreSQL queries, the pure V1 ranker,
 and an authenticated cursor. The first read loads activity and watch inputs
-only on a cold personalized order. Discovery selects bounded fresh, popular,
-and category buckets, then fills any overlap with the newest remaining
-eligible reels before aggregating global share and watch facts. Page SQL uses
-cursor ordinality and current eligibility to fetch creators and products in a
-single PostgreSQL query. Each nonempty page uses the shared read limiter and
+only on a cold personalized order. Discovery selects fresh and popular reels
+using partial B-tree indexes over published rows. Unfiltered feeds look up
+category preferences in batches of up to 60 results per category. Filtered feeds join the selected and preferred categories
+directly to handle sparse intersections. Discovery fills overlapping buckets
+from the newest remaining eligible reels and materializes facts for the
+selected IDs. Page SQL uses cursor ordinality and current eligibility to
+fetch creators and products in a single PostgreSQL query. Each nonempty page uses the shared read limiter and
 rechecks visibility even if catalog projection has not run.
 
 The Redis adapter coalesces reads for each feed order key. Orders depend on
