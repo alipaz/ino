@@ -1,544 +1,230 @@
 # INO Explore
 
-A Go backend with Gin, PostgreSQL, Redis and Docker Compose. INO Explore
-serves a ranked reel feed with optional personalization and cursor pagination.
+A Go and Gin service for a ranked reel feed, linked products, and user
+interactions. PostgreSQL stores the catalog and interactions. Redis accelerates
+reads and is optional for serving requests.
 
-Read [the project contract](docs/project-contract.md),
-[architecture](docs/architecture.md) and [agent instructions](AGENTS.md) before
-starting another phase.
+## Run locally
 
-## Start
-
-Install Docker with Compose v2. No host Go installation or `.env` is needed:
+Docker with Compose v2 is sufficient for the default setup.
 
 ```sh
-docker compose up
+docker compose up --build -d --wait --wait-timeout 120
+curl -fsS --retry 8 --retry-all-errors --retry-delay 1 http://127.0.0.1:8080/readyz
+curl -fsS http://127.0.0.1:8080/livez
 ```
 
-Use `docker compose up --build` after changing Go code or SQL migrations.
-When upgrading an existing stack across the worker rename, run
-`docker compose up --build --remove-orphans` once to remove the old service
-container.
-The API listens at `http://127.0.0.1:8080`. PostgreSQL and Redis are reachable
-as `postgres:5432` and `redis:6379` inside the Compose network; neither publishes
-a host port. Once PostgreSQL is healthy, the one-shot `migrate` service applies
-pending Goose migrations. The one-shot `seed` service then populates a fresh
-database. The API and cache sync worker start after seed succeeds or skips an
-existing database. Redis is optional for API startup and requests.
+Liveness returns `200` while the API is serving. Readiness returns `503`
+when PostgreSQL is unavailable.
 
-## Configuration
+Compose applies the [Goose migrations](migrations/) and runs the seed before
+starting the API and `cache-sync-worker`. Only the API publishes a host port.
+A fresh database contains 24 creators, 240 reels (200 published, 20 drafts,
+20 archived), 120 products, 30 users, and 1,448 Like, Save, and View rows.
+Media URLs are placeholders. The seed runs in a transaction, verifies
+counts and counters, and skips databases that already contain application
+data. `docker compose down` stops the stack and retains the database volume.
 
-Overrides are optional:
+Use [`.env.example`](.env.example) for local overrides. Set `API_PORT` if port
+8080 is occupied. Keep `DATABASE_URL` and the PostgreSQL settings consistent
+when changing credentials. Set `FEED_CURSOR_SECRET` to the same value of at
+least 32 bytes across API instances and restarts if cursors must survive
+them. By default, each process generates its own signing key.
+
+For a host Go run, export a reachable `DATABASE_URL` and optionally `REDIS_URL`.
+With Go 1.25 or newer, run `go run ./cmd/migrate up`, then
+`go run ./cmd/seed` and `go run ./cmd/api`. The API serves on `:8080` unless
+`HTTP_ADDR` is set. The optional worker runs with
+`go run ./cmd/cache-sync-worker`.
+
+## API
+
+Open [Swagger UI](http://127.0.0.1:8080/swagger/index.html) on the local API
+to try the endpoints. Use **Authorize** and enter `1`, `2`, or `3` as the
+`X-User-ID` on a freshly seeded stack. The
+[OpenAPI document](internal/transport/httpapi/openapi.json) is also served at
+`/swagger/openapi.json`.
+
+The feed is public by default. Supply `X-User-ID` with a positive decimal ID
+of an existing user to enable personalization. The same header is required
+for writes, interaction state, and recent activity. It is mock identity for
+this assessment. The product list is public.
+
+### Try the seeded data
+
+User 1 has outdoors history, user 2 has style history, and user 3 starts
+without interactions. Available category slugs are `outdoors`, `style`,
+`home-goods`, `tech`, `fitness`, and `drinkware`.
 
 ```sh
-cp .env.example .env
-# Edit .env, then recreate affected services:
-docker compose up --build
+api=http://127.0.0.1:8080/api/v1
+curl -fsS -H 'X-User-ID: 1' "$api/feed?category=outdoors&limit=5"
+curl -fsS "$api/reels/1/products"
+curl -i -X POST -H 'X-User-ID: 3' "$api/reels/1/like"
+curl -i -X POST -H 'X-User-ID: 3' "$api/reels/1/like"
+curl -i -X DELETE -H 'X-User-ID: 3' "$api/reels/1/like"
 ```
 
-| Variable | Default | Purpose |
-| --- | --- | --- |
-| `API_PORT` | `8080` | API host port, bound to localhost |
-| `POSTGRES_USER` | `ino` | Development database role |
-| `POSTGRES_PASSWORD` | `ino_local` | Development password, not a production secret |
-| `POSTGRES_DB` | `ino` | Development database |
-| `DATABASE_URL` | `postgres://ino:ino_local@postgres:5432/ino?sslmode=disable` | API connection string |
-| `DB_STARTUP_TIMEOUT` | `30s` | Maximum PostgreSQL startup wait |
-| `REDIS_URL` | Compose `redis://redis:6379/0` | Redis endpoint. For a host run, leave it empty to use PostgreSQL only. |
-| `CACHE_REDIS_TIMEOUT` | `50ms` | Deadline per Redis operation |
-| `FEED_CURSOR_SECRET` | Random per process | Signing key of at least 32 bytes. Set the same secret across API instances and restarts to preserve cursors. |
-| `LOG_LEVEL` | `info` | `debug` includes cache hit, miss, fallback, and cache sync worker lag logs |
-
-When changing `POSTGRES_*`, update `DATABASE_URL` to match and URI-encode reserved
-characters in credentials. PostgreSQL initialization variables apply only to a
-new data volume; existing roles/passwords must be changed in PostgreSQL itself.
-`.env`, other local environment files and key/secret files are Git-ignored and
-excluded from the Docker build context. Commit only example credentials.
-
-For a host Go run (Go 1.25+), supply `DATABASE_URL` for a PostgreSQL instance
-reachable from the host, run `go run ./cmd/migrate up`, then
-`go run ./cmd/seed` and `go run ./cmd/api`. The API defaults `HTTP_ADDR` to `:8080`; Compose fixes the internal
-address at `:8080`. `.env` is read by Compose, not by the Go binary.
-
-The build pins Go 1.25.4 and Alpine 3.22.2; Compose pins PostgreSQL 18.6 and
-Redis 8.10.2. The application uses go-redis v9, and Redis persists via AOF.
-
-## Migrations
-
-Goose runs the embedded SQL files in `migrations/`. API and migrator use the
-same `DATABASE_URL`. Goose records applied versions in `goose_db_version`.
-A normal `docker compose down` followed by `docker compose up` reuses the
-named PostgreSQL volume and preserves existing rows.
-
-Migration `00002_create_reel_interactions.sql` assumes an empty pre-launch
-reel catalog on first application. Every reel must have a positive
-`duration_ms`, and the migration supplies no default duration for older
-rows. If your volume already contains reels, preserve it and plan a duration
-backfill before applying migration 00002 there. Use a disposable database
-for the examples and tests below.
+Copy a non-null `next_cursor` from the feed response into `NEXT_CURSOR`, then
+send it with the same user and category.
 
 ```sh
-docker compose logs migrate
-docker compose run --rm migrate status
-docker compose run --rm --build migrate up
-```
-
-## Assessment demo
-
-A fresh Compose database receives 24 creators, 240 reels (200 published,
-20 drafts, and 20 archived), 120 products, 30 users, and 1,448 like, save,
-and counted-view rows. It also includes six shares and nine final-watch
-sessions. Media URLs are synthetic placeholders. The available categories are
-`outdoors`, `style`, `home-goods`, `tech`, `fitness`, and `drinkware`.
-
-The seed takes a transaction-level PostgreSQL lock to serialize concurrent
-runs. It skips if it finds any application rows. It verifies the dataset
-and reel counters before committing, and the existing activity hooks record
-the seeded actions. `docker compose down` retains the volume. A later
-`docker compose up` skips the seed on that volume.
-
-Try `X-User-ID: 1` for outdoors, `X-User-ID: 2` for style, and
-`X-User-ID: 3` for a viewer without history. These IDs apply to a fresh demo
-volume.
-
-```sh
-curl -H 'X-User-ID: 1' 'http://127.0.0.1:8080/api/v1/feed?limit=10'
-curl -H 'X-User-ID: 2' 'http://127.0.0.1:8080/api/v1/feed?limit=10'
-curl 'http://127.0.0.1:8080/api/v1/feed?category=outdoors&limit=10'
-```
-
-Copy `next_cursor` from a response and repeat its viewer and category. For
-the public outdoors example:
-
-```sh
-NEXT_CURSOR='<paste next_cursor here>'
-curl -G 'http://127.0.0.1:8080/api/v1/feed' \
-  --data-urlencode 'category=outdoors' --data-urlencode 'limit=10' \
+curl -fsSG -H 'X-User-ID: 1' "$api/feed" \
+  --data-urlencode 'category=outdoors' --data-urlencode 'limit=5' \
   --data-urlencode "cursor=$NEXT_CURSOR"
 ```
 
-Inspect seed status with `docker compose logs seed`.
+### Routes
 
-## Explore feed
+The table uses paths relative to `/api/v1`.
 
-```sh
-curl 'http://127.0.0.1:8080/api/v1/feed?limit=20'
-curl -H 'X-User-ID: 1' 'http://127.0.0.1:8080/api/v1/feed?category=outdoors&limit=10'
-curl -G -H 'X-User-ID: 1' 'http://127.0.0.1:8080/api/v1/feed' \
-  --data-urlencode 'category=outdoors' --data-urlencode 'limit=10' \
-  --data-urlencode "cursor=$NEXT_CURSOR"
-```
-
-Use an existing user ID for personalization. Omit the header for the public
-feed. An invalid identity returns 401. Users without useful signals receive
-public ranking. Category is a lowercase slug of at most 64 ASCII characters.
-A matching published reel may have products in other categories, and its
-response includes all attached products in display order. Feed items also
-include creator, duration, and reel counters. An empty response is
-`{"items":[],"next_cursor":null}`.
-
-The default limit is 20 and the maximum is 50. Invalid parameters and
-cursors return 400. An expired cursor returns 410. Use the same viewer and
-category throughout a browse. A signed cursor freezes up to 200 ordered IDs
-for 10 minutes from the first page. Its maximum encoded size is 2,291 bytes.
-Continuation pages keep those IDs even if ranking changes or Redis is
-unavailable. They skip reels that are no longer published or no longer
-match the filter and advance past skipped positions. The feed does not
-append newly eligible reels to an existing browse.
-
-### Ranking V1 and final watch reports
-
-V1 project heuristics are share **+5**, active save **+4**, quality watch
-**+3**, active like **+2**, simple view **0**, and quick skip **−2**.
-Candidates come from freshness, the unweighted sum of active likes and saves
-for popular discovery, and up to five strongest positive categories. V1
-weights apply after discovery. Public discovery reserves
-100 fresh and 100 popular positions. Personalized discovery with preferred
-categories reserves 70 fresh, 70 popular, and 60 category positions.
-When buckets overlap, the newest remaining eligible reels fill those slots
-up to the 200-reel limit. Ranking runs after this selection.
-
-Global shares are deduplicated by sender and reel. The ranking input uses
-the maximum stored watch time per user and reel. A watch below 20% is a
-quick skip, 20% through just under 70% is neutral, and 70% or above is a
-quality watch. The thresholds are evaluated without rounding percentages.
-The client sends its final cumulative `watched_ms` to the existing
-`PUT /api/v1/reels/{id}/watch-sessions/{playback_id}` when leaving the reel.
-It sends no interim reports and reuses the playback ID for retries. The
-existing `watch_interest` event adds no separate ranking signal.
-
-Signed engagement is normalized with
-`sign(score) * log1p(min(abs(score), 100)) / log1p(100)`. Freshness decays
-with a 48-hour half-life. The base score is 55% freshness and 45% normalized
-engagement. Personalization uses up to 100 recent activity events with a
-seven-day half-life. A removal cancels the corresponding active like or save.
-Untimestamped watch preferences are separate, weighted at 0.5, and drawn from
-up to 100 watched reels ordered by reel creation time and ID. Signals split
-across distinct categories. Affinities are normalized by the largest absolute
-category total, and a candidate uses the mean of its category affinities.
-The personal weight is the lesser of 0.35 and 0.07 times the number of reels
-with a useful nonzero signal. Scores sort descending, then creation time and
-ID descending.
-
-### Feed cache behavior
-
-Identity and first-page ordering use Redis first. A cached order lasts up to
-15 seconds. Each nonempty order is materialized in one PostgreSQL query that
-reads current publication, category eligibility, counters, creator, and
-products. Archived reels are skipped even while the worker is behind.
-Newly eligible reels can join a fresh browse when the cached order is refreshed.
-
-Committed catalog events invalidate orders. Activity refreshes only that
-viewer's first-page orders across categories. Guests and other viewers can
-reflect global engagement changes when their orders expire. Watch reports
-without an outbox event affect a new browse when its cached order expires.
-
-Redis misses and failures fall back to bounded, coalesced PostgreSQL reads.
-This work shares its read budget with feed page queries. The API returns 503
-if PostgreSQL is unavailable or a read cannot be admitted within its limit.
-Redis is optional at startup. See [Redis behavior and freshness](#redis-behavior-and-freshness)
-for admission limits and verification setup.
-
-## List products for a published reel
-
-```sh
-curl -i http://127.0.0.1:8080/api/v1/reels/1/products
-```
-
-The endpoint accepts a decimal reel ID from 1 through 9223372036854775807.
-A published reel returns HTTP 200 and `{"products":[...]}`. Each product has
-`id`, `title`, `brand`, `image_url`, `price` (USD cents), and `category`
-(a lowercase slug). Results are ordered by display position, then by product
-ID, both ascending. A published reel with no products returns
-`{"products":[]}`. The example returns products for seeded reel 1 on a fresh
-Compose installation.
-
-| Status | Meaning |
-| --- | --- |
-| 400 | Invalid reel ID |
-| 404 | Missing, draft, or archived reel |
-| 503 | PostgreSQL fallback unavailable or at capacity |
-| 500 | Unexpected server failure |
-
-Errors use `{"error":"..."}`. This endpoint is public and ignores `X-User-ID`.
-
-## Reel interactions, shares, and watch progress
-
-All routes in this table are under `/api/v1/reels/{id}`. Use one
-`X-User-ID` header with the positive decimal ID of an existing user. The
-header is mock identity. The product listing remains public.
-
-| Method and path | Success | Retry behavior |
+| Method and path | Success | Contract |
 | --- | --- | --- |
-| `POST /like`, `POST /save` | 204 | Sets one active like or save per user and reel. |
-| `DELETE /like`, `DELETE /save` | 204 | Clears that active row, including when already absent. |
-| `POST /view` | 204 | Counts once per user and reel per server UTC calendar date. |
-| `POST /share` | 201 | Same sender, key, reel, and recipient replay the original receipt even after archival. A different valid payload for that sender and key returns 409. |
-| `PUT /watch-sessions/{playback_id}` | 200 | Keeps the highest cumulative active watch time. Reusing the playback ID for another reel under the same user returns 409. |
+| `GET /feed` | 200 | Returns `{items, next_cursor}`. Optional query parameters are `limit` (1–50, default 20), `category` (lowercase slug, up to 64 characters), and `cursor`. |
+| `GET /reels/{id}/products` | 200 | Returns `{products}`, including an empty array for a published reel without products. |
+| `POST /reels/{id}/like`, `POST /reels/{id}/save` | 204 | Sets the caller's active Like or Save. Repetition leaves one active row. |
+| `DELETE /reels/{id}/like`, `DELETE /reels/{id}/save` | 204 | Clears the caller's active Like or Save. An already absent interaction also returns 204. |
+| `POST /reels/{id}/view` | 204 | Counts at most once per user and reel on each server UTC calendar date. |
+| `POST /reels/{id}/share` | 201 | Requires `Idempotency-Key` and JSON `{"recipient_user_id":2}`. Repeating the same sender, key, reel, and recipient replays the stored receipt. |
+| `PUT /reels/{id}/watch-sessions/{playback_id}` | 200 | Accepts JSON such as `{"watched_ms":10000}` for cumulative watch time. Returns the stored maximum and `watch_percentage`, capped at 100. The client reports on leaving a reel and reuses the playback ID on retry. |
+| `GET /reels/{id}/interaction-state` | 200 | Returns `{liked, saved}` for the caller. |
+| `GET /me/interactions/recent` | 200 | Returns `{events}` with up to 100 events, newest first, breaking timestamp ties by event ID. |
 
-Keys and playback IDs are case-sensitive and accept 1–128 ASCII characters
-from `A–Z`, `a–z`, `0–9`, and `._~-`. JSON requests are limited to 2 KiB.
-Invalid IDs, keys, and JSON return 400. Missing, malformed, or unknown caller
-identity returns 401. A missing or non-published reel returns 404 unless the
-request replays an existing share. An unknown recipient for a new share
-returns 404. Self-sharing returns 400. Error responses use `{"error":"..."}`.
-Username and email uniqueness use PostgreSQL `lower()` with the database
-collation. Stored values retain case and cannot be blank or surrounded by
-spaces.
+Feed items include creator, media URLs, creation time, duration, counters,
+and products. Recent activity history starts with migration `00003`.
+A category matches any attached product. The item still
+includes all its products. Both product responses use `id`, `title`,
+`brand`, `image_url`, `price` (USD cents), and `category`, ordered by
+display position and then product ID.
 
-With users 1 and 2 and a published reel 1 of duration 30,000 ms in a test database:
+Invalid inputs return `400`, invalid mock identity returns `401`, and
+expired cursors return `410`. Share keys and playback IDs are case-sensitive
+and allow 1–128 characters from `A–Z`, `a–z`, `0–9`, and `._~-`. Their JSON
+bodies are limited to 2 KiB. Missing or unpublished reels generally return
+`404` on reel routes. A stored share receipt can still be replayed after
+archival, and product and interaction-state reads follow the cache behavior
+described below. An unknown share recipient returns `404`. Reusing a share
+key with a different valid payload or a playback ID for another reel returns
+`409`. An unavailable or saturated PostgreSQL read path returns `503`.
+Application errors use `{"error":"..."}`.
 
-```sh
-base=http://127.0.0.1:8080/api/v1/reels/1
-curl -i -X POST "$base/like" -H 'X-User-ID: 1'
-curl -i -X DELETE "$base/like" -H 'X-User-ID: 1'
-curl -i -X POST "$base/view" -H 'X-User-ID: 1'
-curl -i -X POST "$base/share" -H 'X-User-ID: 1' \
-  -H 'Idempotency-Key: share-001' -H 'Content-Type: application/json' \
-  -d '{"recipient_user_id":2}'
-curl -i -X PUT "$base/watch-sessions/playback-001" -H 'X-User-ID: 1' \
-  -H 'Content-Type: application/json' -d '{"watched_ms":21000}'
-```
+## Design
 
-A share returns `id`, `sender_id`, `recipient_id`, `reel_id`,
-`idempotency_key`, and the UTC `created_at` of the stored record. Use a new
-key to intentionally resend while the reel is published. Replaying an existing
-receipt preserves its ID, timestamp, and every response field. Watch progress
-returns `{"watched_ms":21000,"watch_percentage":70}` for the example above. It
-measures cumulative active playback in milliseconds. The percentage uses
-the stored time and caps at 100. Watch reports do not count as views.
+### Data model and concurrency
 
-## Interaction state and recent activity
+Go handlers call use cases through a small layered design. PostgreSQL stores
+creators, reels, products, and interactions. `reel_products` models the
+many-to-many product relationship and display order.
 
-Both reads require `X-User-ID` for an existing user. With the fixtures above:
+Like, Save, and View operations update the interaction and its counter in
+one transaction. Uniqueness constraints enforce idempotency under concurrent
+requests. See the [architecture guide](docs/architecture.md#data-and-transaction-boundaries)
+for the locking rules, constraints, and outbox behavior.
 
-```sh
-curl -fsS -H 'X-User-ID: 1' http://127.0.0.1:8080/api/v1/reels/1/interaction-state
-curl -fsS -H 'X-User-ID: 1' http://127.0.0.1:8080/api/v1/me/interactions/recent
-```
+#### Deferred asynchronous view counting
 
-Interaction state returns `{"liked":false,"saved":false}` when both flags are
-unset and returns 404 for a missing, draft, or archived reel. Recent activity
-returns `{"events":[...]}`, or `{"events":[]}` for an empty history. Each event
-has `id`, `user_id`, `reel_id`, `type`, and UTC `event_time`. It returns up
-to 100 events ordered by event time descending, then event ID descending.
-Missing or invalid identity returns 401. An overloaded or unavailable
-PostgreSQL fallback returns `503 {"error":"read_unavailable"}`.
+For higher view traffic, the preferred design would persist each view event
+before acknowledging the request. A worker would deduplicate events by user,
+reel, and the original UTC view date, then update the interaction and counter
+in one transaction. This moves counting off the request path, with counts
+reflecting new views after the worker processes them.
 
-History begins with migration 00003. Events include `like_added`,
-`like_removed`, `save_added`, `save_removed`, `view_counted`,
-`share_created`, and `watch_interest`. The watch event records only the
-first crossing of 70% in a playback session. A session that already reached
-70% before migration is treated as having crossed the threshold without
-creating a historical event. The watch API and duplicate-report behavior
-stay the same.
+This design was deferred to fit the assessment timebox. The API currently
+counts views synchronously in PostgreSQL. The existing `cache-sync-worker`
+projects committed activity to Redis.
 
-## API and cache sync worker
+### Feed ranking and pagination
 
-`docker compose up --build` starts two independent processes after migration.
-Only `api` serves HTTP. Its PostgreSQL pool is capped at 10 connections, with
-up to four concurrent PostgreSQL reads shared between cache fallbacks and feed
-pages. Its Redis client is capped at 12 connections. The `cache-sync-worker`
-service has its own pool with two PostgreSQL connections, one for the outbox
-transaction and one for a snapshot read. It also uses a separate Redis client capped at
-two connections. Outbox batches have a five-second deadline, and PostgreSQL
-snapshot reads have a 750 ms deadline. Both processes use
-`CACHE_REDIS_TIMEOUT` for Redis calls.
+Discovery takes up to 200 published candidates from fresh and popular
+groups. The public split is 100 fresh and 100 popular, using active Likes
+plus Saves for popularity. Personalized discovery can reserve 60 slots
+for up to five preferred categories, with 70 each for fresh and popular reels.
+After deduplication, the newest remaining eligible reels fill the open
+slots. Partial PostgreSQL indexes support freshness and popularity ordering.
 
-With `DATABASE_URL` and `REDIS_URL` set, run the worker locally with
-`go run ./cmd/cache-sync-worker`. SIGINT or SIGTERM cancels polling and any active
-batch. Unacknowledged rows stay in PostgreSQL. Stop or start the Compose
-worker independently with `docker compose stop cache-sync-worker` and
-`docker compose start cache-sync-worker`. The API can keep serving and writing
-while the worker is stopped.
+The engagement signal `E` is +5 per share, +4 per active Save, +3 per quality
+watch, +2 per active Like, 0 per View, and −2 per quick skip. Shares count
+once per sender and reel. Watch scoring uses each viewer's maximum watch
+time on the reel. Under 20% is a quick skip, 20% through just under 70% is
+neutral, and 70% or more is a quality watch.
 
-## Redis behavior and freshness
+The base score is 55% freshness and 45% normalized engagement. Freshness
+has a 48-hour half-life. Engagement normalization is
+`sign(E) × log(1 + min(abs(E), 100)) / log(101)`. Personalization derives
+category affinity from up to 100 recent activity events with a seven-day
+half-life. A removal cancels the corresponding active Like or Save. It also
+uses up to 100 watched reels, ordered by reel creation time and ID, at weight
+0.5. Signals split across distinct categories. Affinity is normalized by the
+largest absolute category total, and each reel uses its mean category affinity. The ranking
+blends that mean with the base score at weight `min(0.35, 0.07 × useful_reels)`.
+Ties break by creation time and then reel ID, both descending.
 
-| Entry | TTL |
-| --- | ---: |
-| Public reel products and publication state | 15 seconds |
-| Interaction state and publication state | 10 seconds |
-| Recent activity snapshot | 15 seconds |
-| Mock identity existence | 15 seconds |
-| Immutable share receipt | 5 minutes |
+A signed cursor holds up to 200 ordered IDs and expires ten minutes from
+the first page. It is bound to the user and category. Continuations keep
+the initial order and skip reels that have since been archived or no longer
+match the filter. A nonempty page reads current eligibility and details from
+PostgreSQL even when the order is cached. A single browse covers up to 200
+eligible reels, even in larger catalogs. Newly eligible reels can enter a
+fresh browse after the order is refreshed.
 
-Warm product, interaction-state, and recent-activity GETs read Redis, including
-cached identity and reel visibility checks. Valid empty results and false
-flags are cache hits. Missing, incomplete, or unavailable entries fall back
-to PostgreSQL. Each API process coalesces simultaneous cache loads of the same
-key. Cache misses and feed page queries share four concurrent read slots and
-up to 16 waiting slots. A queued read can wait up to 100 ms, followed by up to
-750 ms for the PostgreSQL read. A full waiting queue returns 503 immediately.
-Cache population is best effort.
+### Cache and operations
 
-PostgreSQL commits writes and activity together. Redis reads can lag while the
-cache sync worker delivers committed invalidations. For example, a previously
-cached published reel can briefly return its products after archival until the
-catalog invalidation reaches Redis or the entry expires. Expiration is
-measured from the fill and reads do not extend it. The worker polls every
-250 ms when idle and retries after one second if Redis fails or the guarded
-snapshot write cannot prove it is current. A complete, byte-identical
-foreground fill in the same generation is acknowledged without refreshing
-its TTL. Redis outages keep writes durable
-and leave undelivered outbox work in PostgreSQL. Activity snapshots rebuild
-from the ordered PostgreSQL history after Redis data loss.
+Redis caches first-page order and selected reads. PostgreSQL holds durable
+writes and tracks cache work for `cache-sync-worker`. Cache misses fall back
+to bounded PostgreSQL reads. When the worker falls behind, cached products or
+interaction state can briefly show the previous publication state. The feed
+checks publication on every nonempty page. See the
+[architecture guide](docs/architecture.md#cache-invalidation-and-recovery)
+for invalidation, timeouts, and capacity limits.
 
-Share requests still validate identity with PostgreSQL. A cached receipt
-then bypasses the PostgreSQL share writer and returns the original response,
-including after archival. The receipt is cached only after PostgreSQL
-commits. An unavailable cache falls back to the existing transactional share
-path, including its payload check and database uniqueness constraint.
+Migration `00002` assumes an empty reel catalog on first application. An
+existing catalog needs a duration backfill before that migration.
 
-## Smoke checks
-
-In another terminal while the stack is running:
-
-```sh
-curl --fail http://127.0.0.1:8080/livez
-curl --fail http://127.0.0.1:8080/readyz
-docker compose exec -T redis redis-cli ping
-docker compose ps
-docker compose logs api
-```
-
-Expect HTTP 200 (`alive`, `ready`) and Redis `PONG`. Readiness returns 503 when
-PostgreSQL cannot be pinged within one second; liveness stays 200 while the
-process is serving. Redis health does not participate in application readiness.
-Logs are structured JSON. SIGINT/SIGTERM drains HTTP before closing the pool.
-
-## Verify changes
+## Verify
 
 ```sh
 go test ./...
 go vet ./...
-docker compose config
+docker compose config --services
 ```
 
-Use a dedicated project name and a free port for isolated runtime checks so
-existing containers and named volumes are unaffected (choose a unique name
-for each run):
+The integration suite runs with disposable PostgreSQL and Redis. It covers
+concurrent and repeated interactions, rollback, seed re-runs, complete
+seeded feed traversal, publication changes, and Redis fallback. PostgreSQL
+tests create temporary schemas. The Redis suite flushes its test database,
+so use a disposable instance. The example below uses Docker-assigned local
+ports and removes only its two test containers.
 
 ```sh
-export COMPOSE_PROJECT_NAME=ino-cache-smoke-unique
-export LOG_LEVEL=debug
-export API_PORT=18080
-docker compose up --build -d --wait --wait-timeout 120
-curl --fail http://127.0.0.1:18080/livez
-curl --fail http://127.0.0.1:18080/readyz
-docker compose exec -T redis redis-cli ping
-docker compose stop postgres
-curl -i http://127.0.0.1:18080/readyz # Expect 503
-curl --fail http://127.0.0.1:18080/livez # Still 200
-docker compose start postgres
-# Allow PostgreSQL to finish starting; /readyz should return 200 again.
-curl --retry 10 --retry-all-errors --retry-delay 1 --fail http://127.0.0.1:18080/readyz
-docker compose down --volumes # Deletes this disposable project's data only
-unset COMPOSE_PROJECT_NAME API_PORT LOG_LEVEL
+(
+  set -eu
+  test_id="ino-test-$(date +%s)-$$"
+  pg="$test_id-postgres"
+  redis="$test_id-redis"
+  trap 'docker stop "$pg" "$redis" >/dev/null 2>&1 || true' EXIT
+
+  docker run --rm -d --name "$pg" -p 127.0.0.1::5432 \
+    -e POSTGRES_PASSWORD=ino_test postgres:18.6-alpine
+  docker run --rm -d --name "$redis" -p 127.0.0.1::6379 redis:8.10.2-alpine3.23
+
+  for attempt in $(seq 1 30); do
+    if docker exec "$pg" pg_isready -q -h 127.0.0.1 -U postgres &&
+       docker exec "$redis" redis-cli ping | grep -qx PONG; then
+      break
+    fi
+    sleep 1
+  done
+  docker exec "$pg" pg_isready -q -h 127.0.0.1 -U postgres
+  docker exec "$redis" redis-cli ping | grep -qx PONG
+
+  INO_TEST_DATABASE_URL="postgres://postgres:ino_test@$(docker port "$pg" 5432)/postgres?sslmode=disable" \
+  INO_TEST_REDIS_URL="redis://$(docker port "$redis" 6379)/0" \
+    go test -count=1 -p 1 ./...
+)
 ```
 
-To check Redis fallback manually in that disposable stack, warm the three GETs
-above against the chosen API port after loading test fixtures. Repeat them
-and look for `cache read` logs with outcome `hit`. Run
-`docker compose stop redis`, repeat the same GETs, and check that the bodies
-match and the logs show `postgres read`. Run `docker compose start redis` to
-allow cache fills and queued invalidations to resume. Perform this check
-before bringing the disposable stack down. The integration suite below
-counts pgx queries for Redis-only product, interaction-state, and activity reads
-and verifies one PostgreSQL statement for a nonempty feed with a cached order.
+See the [API benchmark](docs/benchmark.md) for measured latency, throughput,
+and reproduction steps.
 
-## PostgreSQL integration tests
-
-The tests apply the same migrations to a temporary schema in a PostgreSQL
-database and remove that schema afterward. The test role needs permission to
-create schemas. Without `INO_TEST_DATABASE_URL`, `go test ./...` skips these
-cases. The combined Redis tests also require `INO_TEST_REDIS_URL` pointing to
-an empty, disposable Redis database. The suite flushes that test database.
-Choose free local ports and unused container names:
-
-```sh
-docker run --rm -d --name ino-postgres-test \
-  -e POSTGRES_PASSWORD=ino_test -p 127.0.0.1:15432:5432 postgres:18.6-alpine
-# Wait for this command to report "accepting connections".
-docker exec ino-postgres-test pg_isready -h 127.0.0.1 -U postgres
-docker run --rm -d --name ino-redis-test -p 127.0.0.1:16379:6379 redis:8.10.2-alpine
-INO_TEST_DATABASE_URL='postgres://postgres:ino_test@127.0.0.1:15432/postgres?sslmode=disable' \
-INO_TEST_REDIS_URL='redis://127.0.0.1:16379/0' \
-  go test -count=1 -p 1 -v ./internal/adapter/postgres ./internal/adapter/redis -run 'Postgres(Redis)?$|Redis$'
-docker stop ino-postgres-test ino-redis-test
-```
-
-## Feed benchmark
-
-Use a fresh, disposable Compose project and a free API port for each version
-and dataset size. The benchmark SQL loads synthetic reels, products, like and
-save rows, shares, and watch sessions after migrations. It requires an empty
-application database. Sizes of 10,000 and 100,000 reels make it easier to see
-the effect of catalog growth. The normal assessment seed still runs on regular
-Compose startup.
-
-From the version you want to measure, point `benchmark_dir` at the directory
-holding these two scripts. Use the same scripts and workload for both versions.
-
-```sh
-benchmark_dir="$PWD/scripts"  # use an absolute path when measuring an older checkout
-benchmark_reels=10000
-export COMPOSE_PROJECT_NAME="ino-feed-bench-$(date +%s)"
-export API_PORT=18080
-bench_compose() {
-  DATABASE_URL='postgres://ino:ino_local@postgres:5432/ino?sslmode=disable' \
-  POSTGRES_USER=ino POSTGRES_PASSWORD=ino_local POSTGRES_DB=ino \
-  REDIS_URL='redis://redis:6379/0' \
-    docker compose --env-file /dev/null -p "$COMPOSE_PROJECT_NAME" "$@"
-}
-
-bench_compose up -d --wait postgres redis
-bench_compose run --build --rm --no-deps migrate up
-bench_compose exec -T postgres psql -X -U ino -d ino -v reels="$benchmark_reels" \
-  < "$benchmark_dir/feed_benchmark.sql"
-bench_compose up --build -d --no-deps api
-curl --fail --retry 8 --retry-all-errors --retry-delay 1 "http://127.0.0.1:$API_PORT/readyz"
-
-for benchmark_mode in warm cold; do
-  python3 "$benchmark_dir/feed_benchmark.py" --base-url "http://127.0.0.1:$API_PORT" --mode "$benchmark_mode"
-done
-bench_compose stop redis
-python3 "$benchmark_dir/feed_benchmark.py" --base-url "http://127.0.0.1:$API_PORT" --mode redis-off
-
-bench_compose down --volumes
-unset COMPOSE_PROJECT_NAME API_PORT
-```
-
-The client uses eight concurrent workers by default and reports successful
-requests per second, p95 among successful responses, and the percentage of
-controlled 503s. The workload alternates between filtered and unfiltered
-authenticated feeds. Warm mode primes a small set of viewers. Cold mode uses
-a new viewer for every request and should run once on a fresh stack. The
-cache sync worker is omitted from these commands to keep cache invalidation traffic
-out of the read-focused workload.
-
-### Before and after
-
-One local run compared commit `406827b` with the indexed query using Go
-1.25.4 on macOS arm64. The API ran on the host with disposable PostgreSQL
-18.6 and Redis 8.10.2 containers. Each row uses 64 requests with eight
-concurrent workers. Each p95
-includes successful requests only, so read it alongside throughput and 503s.
-
-| Reels | Cache | p95 (ms) | Successful responses/s | HTTP 503 |
-| ---: | --- | ---: | ---: | ---: |
-| 10,000 | Warm | 7.1 → 6.4 | 1,472.3 → 1,648.2 | 0.0% → 0.0% |
-| 10,000 | Cold | 94.3 → 40.6 | 118.5 → 279.0 | 0.0% → 0.0% |
-| 10,000 | Redis off | 202.4 → 182.6 | 58.1 → 74.6 | 0.0% → 0.0% |
-| 100,000 | Warm | 13.8 → 12.0 | 1,220.5 → 1,339.4 | 0.0% → 0.0% |
-| 100,000 | Cold | 677.6 → 80.9 | 8.8 → 138.9 | 73.4% → 0.0% |
-| 100,000 | Redis off | 815.2 → 190.1 | 7.7 → 58.2 | 64.1% → 0.0% |
-
-On 100,000 reels, `EXPLAIN (ANALYZE, BUFFERS)` for unfiltered public discovery
-went from 61.4 ms to 6.5 ms. The previous plan materialized 90,000 eligible
-reels. The indexed plan read 100 rows each from the freshness and popularity
-indexes and 200 from the freshness index for backfill. Temporarily dropping
-the popularity index raised the same query to 39.4 ms. The index therefore
-improves cold reads while adding maintenance to Like and Save counter updates.
-A separate 3,000-row update probe used about 29,100 shared-buffer accesses
-before and 49,900 after. That probe measures SQL work on a batch, with no
-application write traffic.
-
-Personalized discovery with a category filter still took about 110 ms in
-one SQL probe. The synthetic fixture has six common categories. A rare
-preferred category can cause a longer recency scan, and this benchmark does
-not estimate capacity on production data.
-
-To inspect plans on the disposable project, enable PostgreSQL plan logging
-before cleanup and outside timed runs. Restart the API to open new sessions.
-A feed request with a cold order logs the candidate query's plan. Use an
-uncached viewer such as user 200 on the default
-benchmark workload.
-
-```sh
-bench_compose exec -T postgres psql -X -U ino -d ino -v ON_ERROR_STOP=1 <<'SQL'
-ALTER DATABASE ino SET session_preload_libraries = 'auto_explain';
-ALTER DATABASE ino SET auto_explain.log_min_duration = 0;
-ALTER DATABASE ino SET auto_explain.log_analyze = on;
-ALTER DATABASE ino SET auto_explain.log_buffers = on;
-ALTER DATABASE ino SET auto_explain.log_timing = off;
-SQL
-bench_compose start redis
-bench_compose restart api
-curl --fail --retry 8 --retry-all-errors --retry-delay 1 -H 'X-User-ID: 200' \
-  "http://127.0.0.1:$API_PORT/api/v1/feed"
-bench_compose logs --tail 300 postgres
-```
-
-## Shutdown
-
-For normal development, stop services and retain data:
-
-```sh
-docker compose down
-```
-
-`docker compose down --volumes` also deletes the selected project's database
-data. Use it only when intentionally resetting that project's local data.
-
-See the [Prompt 0 verification record](docs/superpowers/plans/2026-11-22-prompt0.md)
-for checks actually run in this implementation session.
+See the [contributor guide](AGENTS.md) for the code map, design constraints,
+and verification checklist.

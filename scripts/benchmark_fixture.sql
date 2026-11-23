@@ -6,7 +6,7 @@ DO $$
 BEGIN
     IF EXISTS (SELECT FROM creators) OR EXISTS (SELECT FROM users)
         OR EXISTS (SELECT FROM products) OR EXISTS (SELECT FROM reels) THEN
-        RAISE EXCEPTION 'Feed benchmark requires an empty application database';
+        RAISE EXCEPTION 'API benchmark requires an empty application database';
     END IF;
 END
 $$;
@@ -16,7 +16,7 @@ SELECT 'Benchmark creator ' || n FROM generate_series(1, 100) AS series(n);
 
 INSERT INTO users (username, email)
 SELECT 'bench-' || n, 'bench-' || n || '@example.test'
-FROM generate_series(1, 256) AS series(n) ORDER BY n;
+FROM generate_series(1, 512) AS series(n) ORDER BY n;
 
 INSERT INTO products (title, brand, image_url, price, category)
 SELECT 'Benchmark product ' || n, 'Demo', 'https://example.test/image', 1000 + n,
@@ -56,6 +56,10 @@ INSERT INTO user_reel_watch_sessions (user_id, reel_id, playback_id, watched_ms)
 SELECT 1 + id % 256, id, 'bench-watch-' || id, 2000 + (id * 31) % 28000
 FROM reels WHERE status = 'published' AND id % 3 = 0;
 
+-- The loader runs before the API and worker, against an empty Redis instance.
+-- Keep durable history, then discard invalidations for cache entries that never existed.
+DELETE FROM cache_outbox;
+
 COMMIT;
 VACUUM (ANALYZE) reels, products, reel_products, users, user_interactions,
-    activity_events, reel_shares, user_reel_watch_sessions;
+    activity_events, reel_shares, user_reel_watch_sessions, cache_outbox;

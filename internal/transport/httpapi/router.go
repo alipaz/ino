@@ -38,5 +38,6 @@ func NewRouter(logger *slog.Logger, ping func(context.Context) error) *gin.Engin
 		}
 		c.JSON(http.StatusOK, gin.H{"status": "ready"})
 	})
+	registerSwaggerRoutes(router)
 	return router
 }
